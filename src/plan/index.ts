@@ -9,6 +9,11 @@ import {
   EquipmentCategory,
   DifficultyLevel,
   BodyLimitation,
+  PlanGenerationResult,
+  PlanGenerationWarning,
+  ExerciseAlternative,
+  UnresolvableDay,
+  Exercise,
 } from '../types';
 import { ExerciseLibrary } from '../exercise';
 import { getTemplate } from './templates';
@@ -64,44 +69,76 @@ function filterByEquipment(
   exerciseIds: { exerciseId: string; priority: number }[],
   availableEquipment: EquipmentCategory[],
   library: ExerciseLibrary,
-): { exerciseId: string; priority: number }[] {
-  return exerciseIds.filter((item) => {
+): { exerciseIds: { exerciseId: string; priority: number }[]; filtered: { exerciseId: string; requiredEquipment: EquipmentCategory[] }[] } {
+  const kept: { exerciseId: string; priority: number }[] = [];
+  const filtered: { exerciseId: string; requiredEquipment: EquipmentCategory[] }[] = [];
+
+  for (const item of exerciseIds) {
     const ex = library.findById(item.exerciseId);
-    if (!ex) return false;
-    return ex.equipment.some(
+    if (!ex) {
+      filtered.push({ exerciseId: item.exerciseId, requiredEquipment: [] });
+      continue;
+    }
+    const hasMatch = ex.equipment.some(
       (eq) => eq === 'none' || availableEquipment.includes(eq),
     );
-  });
+    if (hasMatch) {
+      kept.push(item);
+    } else {
+      filtered.push({ exerciseId: item.exerciseId, requiredEquipment: [...ex.equipment] });
+    }
+  }
+
+  return { exerciseIds: kept, filtered };
 }
 
 function filterByLimitations(
   exerciseIds: { exerciseId: string; priority: number }[],
   limitations: BodyLimitation[],
   library: ExerciseLibrary,
-): { exerciseId: string; priority: number }[] {
-  if (!limitations || limitations.length === 0) return exerciseIds;
+): { exerciseIds: { exerciseId: string; priority: number }[]; filtered: { exerciseId: string; reason: string }[] } {
+  if (!limitations || limitations.length === 0) return { exerciseIds, filtered: [] };
 
   const avoidedIds = new Set<string>();
+  const reasonMap = new Map<string, string>();
   for (const lim of limitations) {
     for (const moveId of lim.movementsToAvoid) {
       avoidedIds.add(moveId);
+      reasonMap.set(moveId, lim.area + '（' + lim.severity + '）限制');
     }
   }
 
-  return exerciseIds.filter((item) => !avoidedIds.has(item.exerciseId));
+  const kept: { exerciseId: string; priority: number }[] = [];
+  const filtered: { exerciseId: string; reason: string }[] = [];
+
+  for (const item of exerciseIds) {
+    if (avoidedIds.has(item.exerciseId)) {
+      filtered.push({ exerciseId: item.exerciseId, reason: reasonMap.get(item.exerciseId) || '身体限制' });
+    } else {
+      kept.push(item);
+    }
+  }
+
+  return { exerciseIds: kept, filtered };
 }
 
 function applyPreferredExercises(
   exerciseIds: { exerciseId: string; priority: number }[],
   preferredIds: string[],
-): { exerciseId: string; priority: number }[] {
-  if (!preferredIds || preferredIds.length === 0) return exerciseIds;
+  library: ExerciseLibrary,
+): { exerciseIds: { exerciseId: string; priority: number }[]; unavailablePreferred: string[] } {
+  if (!preferredIds || preferredIds.length === 0) return { exerciseIds, unavailablePreferred: [] };
+
+  const availableIds = new Set(exerciseIds.map((e) => e.exerciseId));
+  const unavailablePreferred = preferredIds.filter((id) => !availableIds.has(id));
 
   const preferredSet = new Set(preferredIds);
-  return exerciseIds.map((item) => ({
+  const result = exerciseIds.map((item) => ({
     ...item,
     priority: preferredSet.has(item.exerciseId) ? item.priority + 5 : item.priority,
   })).sort((a, b) => b.priority - a.priority);
+
+  return { exerciseIds: result, unavailablePreferred };
 }
 
 function findReplacement(
@@ -110,13 +147,14 @@ function findReplacement(
   limitations: BodyLimitation[],
   library: ExerciseLibrary,
 ): string | null {
-  const replacements = library.getReplacements(exerciseId, availableEquipment);
   const avoidedIds = new Set<string>();
   for (const lim of limitations) {
     for (const moveId of lim.movementsToAvoid) {
       avoidedIds.add(moveId);
     }
   }
+
+  const replacements = library.getReplacements(exerciseId, availableEquipment);
   const valid = replacements.find((r) => !avoidedIds.has(r.id));
   return valid ? valid.id : null;
 }
@@ -154,6 +192,23 @@ function getBaseWeight(
   return Math.round(bodyweight * weightByDifficulty[config.difficulty] * 0.4 * 10) / 10;
 }
 
+interface DayBuildResult {
+  workout: WorkoutDay;
+  warnings: PlanGenerationWarning[];
+  alternatives: ExerciseAlternative[];
+  unresolvable: UnresolvableDay | null;
+}
+
+function buildAvoidedIdSet(limitations: BodyLimitation[]): Set<string> {
+  const avoidedIds = new Set<string>();
+  for (const lim of limitations) {
+    for (const moveId of lim.movementsToAvoid) {
+      avoidedIds.add(moveId);
+    }
+  }
+  return avoidedIds;
+}
+
 function buildWorkoutDay(
   dayIndex: number,
   dayTemplate: {
@@ -164,28 +219,93 @@ function buildWorkoutDay(
   weekNumber: number,
   config: UserConfig,
   library: ExerciseLibrary,
-  totalDays: number,
-): WorkoutDay {
+): DayBuildResult {
+  const warnings: PlanGenerationWarning[] = [];
+  const alternatives: ExerciseAlternative[] = [];
+
   const isRestDay = dayIndex >= config.availableDaysPerWeek;
   const progConfig = getProgressionConfig(config.goal, config.difficulty);
 
   if (isRestDay) {
     return {
-      dayOfWeek: dayIndex + 1,
-      label: '休息日',
-      isRestDay: true,
-      muscleGroups: [],
-      exercises: [],
-      warmup: [],
-      estimatedDurationMinutes: 0,
+      workout: {
+        dayOfWeek: dayIndex + 1,
+        label: '休息日',
+        isRestDay: true,
+        muscleGroups: [],
+        exercises: [],
+        warmup: [],
+        estimatedDurationMinutes: 0,
+      },
+      warnings: [],
+      alternatives: [],
+      unresolvable: null,
     };
   }
 
-  let exercises = filterByEquipment(dayTemplate.exercisePriorities, config.equipment, library);
-  exercises = filterByLimitations(exercises, config.limitations ?? [], library);
-  exercises = applyPreferredExercises(exercises, config.preferredExerciseIds ?? []);
+  const eqResult = filterByEquipment(dayTemplate.exercisePriorities, config.equipment, library);
+  for (const f of eqResult.filtered) {
+    const ex = library.findById(f.exerciseId);
+    warnings.push({
+      type: 'exercise_filtered',
+      message: (ex ? ex.name : f.exerciseId) + '因器械不足被过滤',
+      exerciseId: f.exerciseId,
+      muscleGroups: ex ? ex.muscleGroups : undefined,
+      suggestedEquipment: f.requiredEquipment.filter((eq) => eq !== 'none'),
+    });
 
-  const finalExercises = exercises.map((item) => {
+    if (ex) {
+      const reps = library.getReplacements(f.exerciseId, config.equipment);
+      const avoidedIds = buildAvoidedIdSet(config.limitations ?? []);
+      const validReps = reps.filter((r) => !avoidedIds.has(r.id));
+      if (validReps.length > 0) {
+        alternatives.push({
+          originalExerciseId: f.exerciseId,
+          originalExerciseName: ex.name,
+          reason: '器械不可用',
+          alternatives: validReps,
+        });
+      }
+    }
+  }
+
+  const limResult = filterByLimitations(eqResult.exerciseIds, config.limitations ?? [], library);
+  for (const f of limResult.filtered) {
+    const ex = library.findById(f.exerciseId);
+    warnings.push({
+      type: 'exercise_filtered',
+      message: (ex ? ex.name : f.exerciseId) + '因身体限制被排除（' + f.reason + '）',
+      exerciseId: f.exerciseId,
+      muscleGroups: ex ? ex.muscleGroups : undefined,
+    });
+
+    if (ex) {
+      const reps = library.getReplacements(f.exerciseId, config.equipment);
+      const avoidedIds = buildAvoidedIdSet(config.limitations ?? []);
+      const validReps = reps.filter((r) => !avoidedIds.has(r.id));
+      if (validReps.length > 0) {
+        alternatives.push({
+          originalExerciseId: f.exerciseId,
+          originalExerciseName: ex.name,
+          reason: f.reason,
+          alternatives: validReps,
+        });
+      }
+    }
+  }
+
+  const prefResult = applyPreferredExercises(limResult.exerciseIds, config.preferredExerciseIds ?? [], library);
+  for (const prefId of prefResult.unavailablePreferred) {
+    const ex = library.findById(prefId);
+    warnings.push({
+      type: 'preferred_unavailable',
+      message: '偏好动作' + (ex ? ex.name : prefId) + '在当前器械/限制下不可用',
+      exerciseId: prefId,
+      muscleGroups: ex ? ex.muscleGroups : undefined,
+    });
+  }
+
+  const finalExercises = prefResult.exerciseIds.map((item) => {
     const ex = library.findById(item.exerciseId);
     if (ex) return item;
     const repId = findReplacement(item.exerciseId, config.equipment, config.limitations ?? [], library);
@@ -194,6 +314,32 @@ function buildWorkoutDay(
 
   const maxExercises = config.difficulty === 'beginner' ? 4 : config.difficulty === 'intermediate' ? 6 : 8;
   const selectedExercises = finalExercises.slice(0, maxExercises);
+
+  let unresolvable: UnresolvableDay | null = null;
+
+  if (selectedExercises.length === 0) {
+    const conflictingLimitations: string[] = [];
+    for (const lim of (config.limitations ?? [])) {
+      conflictingLimitations.push(...lim.movementsToAvoid);
+    }
+    const neededEquip = eqResult.filtered.flatMap((f) => f.requiredEquipment.filter((eq) => eq !== 'none'));
+    const uniqueNeeded = [...new Set(neededEquip)];
+
+    unresolvable = {
+      dayIndex: dayIndex + 1,
+      label: dayTemplate.label,
+      targetMuscleGroups: dayTemplate.muscleGroups,
+      reason: '无法为' + dayTemplate.label + '安排任何动作，当前器械条件下无可用动作',
+      missingEquipment: uniqueNeeded,
+      conflictingLimitations,
+    };
+    warnings.push({
+      type: 'day_underpopulated',
+      message: dayTemplate.label + '无可用动作，需要增加器械或放宽限制',
+      muscleGroups: dayTemplate.muscleGroups,
+      suggestedEquipment: uniqueNeeded,
+    });
+  }
 
   const allSets: ExerciseSet[] = [];
   for (const sel of selectedExercises) {
@@ -218,13 +364,18 @@ function buildWorkoutDay(
   );
 
   return {
-    dayOfWeek: dayIndex + 1,
-    label: dayTemplate.label,
-    isRestDay: false,
-    muscleGroups: dayTemplate.muscleGroups,
-    exercises: allSets,
-    warmup,
-    estimatedDurationMinutes: duration,
+    workout: {
+      dayOfWeek: dayIndex + 1,
+      label: selectedExercises.length === 0 ? dayTemplate.label + '（无法安排）' : dayTemplate.label,
+      isRestDay: false,
+      muscleGroups: dayTemplate.muscleGroups,
+      exercises: allSets,
+      warmup,
+      estimatedDurationMinutes: duration,
+    },
+    warnings,
+    alternatives,
+    unresolvable,
   };
 }
 
@@ -233,12 +384,28 @@ export function generatePlan(
   library: ExerciseLibrary,
   totalWeeks: number = DEFAULT_TOTAL_WEEKS,
 ): TrainingPlan {
+  const result = generatePlanWithDiagnostics(config, library, totalWeeks);
+  if (!result.plan) {
+    throw new NoAvailableEquipmentError();
+  }
+  return result.plan;
+}
+
+export function generatePlanWithDiagnostics(
+  config: UserConfig,
+  library: ExerciseLibrary,
+  totalWeeks: number = DEFAULT_TOTAL_WEEKS,
+): PlanGenerationResult {
   validateConfig(config);
 
   const template = getTemplate(config.goal, config.availableDaysPerWeek, config.difficulty);
 
-  const planId = `plan_${config.userId}_${Date.now()}`;
+  const planId = 'plan_' + config.userId + '_' + Date.now();
   const now = new Date().toISOString();
+
+  const allWarnings: PlanGenerationWarning[] = [];
+  const allAlternatives: ExerciseAlternative[] = [];
+  const allUnresolvable: UnresolvableDay[] = [];
 
   const weeks: TrainingWeek[] = [];
   for (let w = 1; w <= totalWeeks; w++) {
@@ -247,15 +414,16 @@ export function generatePlan(
     for (let d = 0; d < 7; d++) {
       const dayTemplateIndex = d % template.days.length;
       const dayTemplate = template.days[dayTemplateIndex];
-      const workout = buildWorkoutDay(
-        d,
-        dayTemplate,
-        w,
-        config,
-        library,
-        config.availableDaysPerWeek,
-      );
-      days.push(workout);
+      const dayResult = buildWorkoutDay(d, dayTemplate, w, config, library);
+      days.push(dayResult.workout);
+
+      if (w === 1) {
+        allWarnings.push(...dayResult.warnings);
+        allAlternatives.push(...dayResult.alternatives);
+        if (dayResult.unresolvable) {
+          allUnresolvable.push(dayResult.unresolvable);
+        }
+      }
     }
 
     let totalVolume = 0;
@@ -273,7 +441,12 @@ export function generatePlan(
     });
   }
 
-  return {
+  const trainingDaysInWeek = weeks[0].days.filter((d) => !d.isRestDay && d.exercises.length > 0).length;
+  const canProceed = trainingDaysInWeek > 0;
+
+  const summary = buildSummary(allWarnings, allUnresolvable, canProceed, config);
+
+  const plan: TrainingPlan = {
     id: planId,
     userId: config.userId,
     goal: config.goal,
@@ -284,4 +457,78 @@ export function generatePlan(
     difficulty: config.difficulty,
     totalWeeks,
   };
+
+  return {
+    plan: canProceed ? plan : null,
+    warnings: deduplicateWarnings(allWarnings),
+    alternatives: deduplicateAlternatives(allAlternatives),
+    unresolvableDays: allUnresolvable,
+    canProceed,
+    summary,
+  };
+}
+
+function buildSummary(
+  warnings: PlanGenerationWarning[],
+  unresolvable: UnresolvableDay[],
+  canProceed: boolean,
+  config: UserConfig,
+): string {
+  if (canProceed && warnings.length === 0) {
+    return '计划生成成功，' + config.availableDaysPerWeek + '天/周' + config.goal + '训练计划已就绪';
+  }
+
+  const parts: string[] = [];
+
+  if (!canProceed) {
+    parts.push('无法生成有效训练计划');
+  } else if (warnings.length > 0) {
+    parts.push('计划已生成，但存在以下问题');
+  }
+
+  const filteredCount = warnings.filter((w) => w.type === 'exercise_filtered').length;
+  const preferredCount = warnings.filter((w) => w.type === 'preferred_unavailable').length;
+  const underpopCount = warnings.filter((w) => w.type === 'day_underpopulated').length;
+
+  if (filteredCount > 0) {
+    parts.push(filteredCount + '个动作因器械/限制被过滤');
+  }
+  if (preferredCount > 0) {
+    parts.push(preferredCount + '个偏好动作不可用');
+  }
+  if (underpopCount > 0) {
+    parts.push(underpopCount + '个训练日无法安排动作');
+  }
+
+  if (unresolvable.length > 0) {
+    const allMissing = [...new Set(unresolvable.flatMap((d) => d.missingEquipment))];
+    const allConflicts = [...new Set(unresolvable.flatMap((d) => d.conflictingLimitations))];
+    if (allMissing.length > 0) {
+      parts.push('建议增加器械：' + allMissing.join('、'));
+    }
+    if (allConflicts.length > 0) {
+      parts.push('建议放宽对以下动作的限制：' + allConflicts.join('、'));
+    }
+  }
+
+  return parts.join('；');
+}
+
+function deduplicateWarnings(warnings: PlanGenerationWarning[]): PlanGenerationWarning[] {
+  const seen = new Set<string>();
+  return warnings.filter((w) => {
+    const key = w.type + '_' + (w.exerciseId ?? '') + '_' + w.message;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function deduplicateAlternatives(alternatives: ExerciseAlternative[]): ExerciseAlternative[] {
+  const seen = new Set<string>();
+  return alternatives.filter((a) => {
+    if (seen.has(a.originalExerciseId)) return false;
+    seen.add(a.originalExerciseId);
+    return true;
+  });
 }

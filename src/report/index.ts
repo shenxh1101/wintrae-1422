@@ -6,19 +6,84 @@ import {
   MuscleGroup,
   FatigueLevel,
   WorkoutDay,
+  PlannedVsActual,
 } from '../types';
 import { ExerciseLibrary } from '../exercise';
 import { RecordStore } from '../record';
 
-export function calculateProgress(plan: TrainingPlan, store: RecordStore): PlanProgress {
-  const completedWeeks = plan.weeks.filter((week) => {
-    const rate = store.getCompletionRateForWeek(plan, week.weekNumber);
-    return rate >= 80;
-  }).length;
+function computePlannedVsActualForWeek(
+  plan: TrainingPlan,
+  weekNumber: number,
+  hasRecords: boolean,
+): PlannedVsActual {
+  const week = plan.weeks.find((w) => w.weekNumber === weekNumber);
 
-  const weeklyPercents = plan.weeks.map((week) =>
-    store.getCompletionRateForWeek(plan, week.weekNumber),
-  );
+  let plannedVolume = 0;
+  let plannedSets = 0;
+  let plannedReps = 0;
+  let plannedWorkouts = 0;
+
+  let actualVolume = 0;
+  let actualSets = 0;
+  let actualReps = 0;
+  let actualWorkouts = 0;
+
+  if (!week) {
+    return { plannedVolume: 0, plannedSets: 0, plannedReps: 0, plannedWorkouts: 0, actualVolume: 0, actualSets: 0, actualReps: 0, actualWorkouts: 0, completionRate: 0 };
+  }
+
+  for (const day of week.days) {
+    if (day.isRestDay || day.exercises.length === 0) continue;
+    plannedWorkouts++;
+
+    let dayAllCompleted = true;
+    for (const set of day.exercises) {
+      plannedSets++;
+      plannedReps += set.targetReps;
+      plannedVolume += set.targetWeight * set.targetReps;
+
+      if (set.completed) {
+        actualSets++;
+        actualReps += set.actualReps ?? 0;
+        actualVolume += (set.actualWeight ?? 0) * (set.actualReps ?? 0);
+      } else {
+        dayAllCompleted = false;
+      }
+    }
+
+    if (dayAllCompleted && day.exercises.length > 0) {
+      actualWorkouts++;
+    }
+  }
+
+  const completionRate = plannedSets > 0 ? Math.round((actualSets / plannedSets) * 100) : 0;
+
+  return {
+    plannedVolume: Math.round(plannedVolume * 10) / 10,
+    plannedSets,
+    plannedReps,
+    plannedWorkouts,
+    actualVolume: Math.round(actualVolume * 10) / 10,
+    actualSets,
+    actualReps,
+    actualWorkouts,
+    completionRate,
+  };
+}
+
+export function calculateProgress(plan: TrainingPlan, store: RecordStore): PlanProgress {
+  const records = store.getRecordsByPlan(plan.id);
+  const hasRecords = records.length > 0;
+
+  const weeklyPercents = plan.weeks.map((week) => {
+    const pva = computePlannedVsActualForWeek(plan, week.weekNumber, hasRecords);
+    return pva.completionRate;
+  });
+
+  const completedWeeks = plan.weeks.filter((week) => {
+    const pva = computePlannedVsActualForWeek(plan, week.weekNumber, hasRecords);
+    return pva.completionRate >= 80;
+  }).length;
 
   const overallCompletion =
     weeklyPercents.length > 0
@@ -35,7 +100,7 @@ export function calculateProgress(plan: TrainingPlan, store: RecordStore): PlanP
     for (const day of week.days) {
       if (day.isRestDay || day.exercises.length === 0) continue;
       totalWorkoutsPlanned++;
-      const allCompleted = day.exercises.every((s) => s.completed);
+      const allCompleted = day.exercises.length > 0 && day.exercises.every((s) => s.completed);
       if (allCompleted) {
         totalWorkoutsCompleted++;
         if (!streakBroken) currentStreak++;
@@ -44,6 +109,26 @@ export function calculateProgress(plan: TrainingPlan, store: RecordStore): PlanP
       }
     }
   }
+
+  let totalPlanned: PlannedVsActual = { plannedVolume: 0, plannedSets: 0, plannedReps: 0, plannedWorkouts: 0, actualVolume: 0, actualSets: 0, actualReps: 0, actualWorkouts: 0, completionRate: 0 };
+  let totalActual: PlannedVsActual = { plannedVolume: 0, plannedSets: 0, plannedReps: 0, plannedWorkouts: 0, actualVolume: 0, actualSets: 0, actualReps: 0, actualWorkouts: 0, completionRate: 0 };
+
+  for (const week of plan.weeks) {
+    const pva = computePlannedVsActualForWeek(plan, week.weekNumber, hasRecords);
+    totalPlanned.plannedVolume += pva.plannedVolume;
+    totalPlanned.plannedSets += pva.plannedSets;
+    totalPlanned.plannedReps += pva.plannedReps;
+    totalPlanned.plannedWorkouts += pva.plannedWorkouts;
+    totalActual.actualVolume += pva.actualVolume;
+    totalActual.actualSets += pva.actualSets;
+    totalActual.actualReps += pva.actualReps;
+    totalActual.actualWorkouts += pva.actualWorkouts;
+  }
+
+  totalPlanned.plannedVolume = Math.round(totalPlanned.plannedVolume * 10) / 10;
+  totalActual.actualVolume = Math.round(totalActual.actualVolume * 10) / 10;
+  totalActual.completionRate = overallCompletion;
+  totalPlanned.completionRate = overallCompletion;
 
   return {
     planId: plan.id,
@@ -54,6 +139,8 @@ export function calculateProgress(plan: TrainingPlan, store: RecordStore): PlanP
     currentStreak,
     totalWorkoutsCompleted,
     totalWorkoutsPlanned,
+    planned: totalPlanned,
+    actual: totalActual,
   };
 }
 
@@ -68,14 +155,11 @@ export function generateWeeklyReport(
     return emptyReport(plan.id, weekNumber);
   }
 
-  const completionRate = store.getCompletionRateForWeek(plan, weekNumber);
-  const feedback = store.getFeedback(plan.id, weekNumber);
+  const records = store.getRecordsByWeek(plan.id, weekNumber);
+  const hasRecords = records.length > 0;
+  const pva = computePlannedVsActualForWeek(plan, weekNumber, hasRecords);
 
-  let totalVolume = 0;
-  let totalSets = 0;
-  let totalReps = 0;
-  let weightSum = 0;
-  let weightCount = 0;
+  const feedback = store.getFeedback(plan.id, weekNumber);
 
   const muscleDistribution: Partial<Record<MuscleGroup, number>> = {};
   const personalRecords: PersonalRecord[] = [];
@@ -84,31 +168,21 @@ export function generateWeeklyReport(
     if (day.isRestDay) continue;
 
     for (const set of day.exercises) {
-      totalSets++;
-      const reps = set.actualReps ?? set.targetReps;
-      const weight = set.actualWeight ?? set.targetWeight;
-      totalReps += reps;
-      totalVolume += weight * reps;
-
-      if (weight > 0) {
-        weightSum += weight;
-        weightCount++;
-      }
-
       const ex = library.findById(set.exerciseId);
       if (ex) {
+        const reps = hasRecords && set.completed ? (set.actualReps ?? 0) : 0;
         for (const mg of ex.muscleGroups) {
           muscleDistribution[mg] = (muscleDistribution[mg] ?? 0) + reps;
         }
       }
 
-      if (set.completed && (set.actualWeight ?? 0) > (set.targetWeight * 0.95)) {
+      if (hasRecords && set.completed && (set.actualWeight ?? 0) > 0) {
         const exName = ex ? ex.name : set.exerciseId;
         personalRecords.push({
           exerciseId: set.exerciseId,
           exerciseName: exName,
-          weight: set.actualWeight ?? set.targetWeight,
-          reps: set.actualReps ?? set.targetReps,
+          weight: set.actualWeight ?? 0,
+          reps: set.actualReps ?? 0,
           achievedAt: new Date().toISOString(),
         });
       }
@@ -121,7 +195,7 @@ export function generateWeeklyReport(
     if (fb) fatigueTrend.push(fb.overallFatigue);
   }
 
-  const recommendations = generateRecommendations(completionRate, feedback?.overallFatigue, feedback?.sleepQuality, personalRecords.length);
+  const recommendations = generateRecommendations(pva.completionRate, feedback?.overallFatigue, feedback?.sleepQuality, personalRecords.length);
 
   const nextWeek = plan.weeks.find((w) => w.weekNumber === weekNumber + 1);
   const nextWeekPreview: WorkoutDay[] = nextWeek
@@ -131,11 +205,29 @@ export function generateWeeklyReport(
   return {
     planId: plan.id,
     weekNumber,
-    completionRate,
-    totalVolume: Math.round(totalVolume * 10) / 10,
-    totalSets,
-    totalReps,
-    averageWeight: weightCount > 0 ? Math.round((weightSum / weightCount) * 10) / 10 : 0,
+    completionRate: pva.completionRate,
+    planned: {
+      plannedVolume: pva.plannedVolume,
+      plannedSets: pva.plannedSets,
+      plannedReps: pva.plannedReps,
+      plannedWorkouts: pva.plannedWorkouts,
+      actualVolume: 0,
+      actualSets: 0,
+      actualReps: 0,
+      actualWorkouts: 0,
+      completionRate: 0,
+    },
+    actual: {
+      plannedVolume: pva.plannedVolume,
+      plannedSets: pva.plannedSets,
+      plannedReps: pva.plannedReps,
+      plannedWorkouts: pva.plannedWorkouts,
+      actualVolume: pva.actualVolume,
+      actualSets: pva.actualSets,
+      actualReps: pva.actualReps,
+      actualWorkouts: pva.actualWorkouts,
+      completionRate: pva.completionRate,
+    },
     personalRecords,
     muscleGroupDistribution: muscleDistribution,
     fatigueTrend,
@@ -152,7 +244,9 @@ function generateRecommendations(
 ): string[] {
   const recs: string[] = [];
 
-  if (completionRate < 50) {
+  if (completionRate === 0) {
+    recs.push('本周尚未开始训练，请尽快安排训练时间');
+  } else if (completionRate < 50) {
     recs.push('本周完成率较低，建议降低训练频率或缩短单次训练时长');
   } else if (completionRate < 80) {
     recs.push('完成率一般，尝试优化训练时间安排');
@@ -173,7 +267,7 @@ function generateRecommendations(
   }
 
   if (prCount && prCount > 0) {
-    recs.push(`本周达成${prCount}项个人记录，继续突破！`);
+    recs.push('本周达成' + prCount + '项个人记录，继续突破！');
   }
 
   if (completionRate >= 80 && (overallFatigue ?? 5) <= 6) {
@@ -184,14 +278,13 @@ function generateRecommendations(
 }
 
 function emptyReport(planId: string, weekNumber: number): WeeklyReport {
+  const empty: PlannedVsActual = { plannedVolume: 0, plannedSets: 0, plannedReps: 0, plannedWorkouts: 0, actualVolume: 0, actualSets: 0, actualReps: 0, actualWorkouts: 0, completionRate: 0 };
   return {
     planId,
     weekNumber,
     completionRate: 0,
-    totalVolume: 0,
-    totalSets: 0,
-    totalReps: 0,
-    averageWeight: 0,
+    planned: empty,
+    actual: empty,
     personalRecords: [],
     muscleGroupDistribution: {},
     fatigueTrend: [],

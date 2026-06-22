@@ -14,12 +14,16 @@ import {
   FitnessGoal,
   MuscleGroup,
   DifficultyLevel,
-  ExerciseSet,
-  WorkoutDay,
+  EquipmentCategory,
+  PlanGenerationResult,
+  SubstitutionResult,
+  SubstitutionImpact,
+  PlanVersionSnapshot,
+  ExportedData,
 } from './types';
 
 import { ExerciseLibrary } from './exercise';
-import { generatePlan } from './plan';
+import { generatePlan, generatePlanWithDiagnostics } from './plan';
 import { getDefaultTemplateConfig } from './plan/templates';
 import { generateWarmup } from './plan/warmup';
 import { computeRestTime } from './plan/progression';
@@ -33,7 +37,6 @@ import {
   InvalidConfigError,
   ExerciseNotFoundError,
   PlanNotFoundError,
-  RecordNotFoundError,
   SubstitutionError,
   DuplicateExerciseError,
   InvalidFeedbackError,
@@ -45,6 +48,8 @@ export class FitnessTrainingSDK {
   private library: ExerciseLibrary;
   private store: RecordStore;
   private plans: Map<string, TrainingPlan> = new Map();
+  private versions: Map<string, PlanVersionSnapshot[]> = new Map();
+  private currentVersion: Map<string, number> = new Map();
 
   constructor() {
     this.library = new ExerciseLibrary();
@@ -52,9 +57,21 @@ export class FitnessTrainingSDK {
   }
 
   generatePlan(config: UserConfig, totalWeeks?: number): TrainingPlan {
-    const plan = generatePlan(config, this.library, totalWeeks);
-    this.plans.set(plan.id, plan);
-    return plan;
+    const result = this.generatePlanWithDiagnostics(config, totalWeeks);
+    if (!result.plan) {
+      throw new NoAvailableEquipmentError();
+    }
+    return result.plan;
+  }
+
+  generatePlanWithDiagnostics(config: UserConfig, totalWeeks?: number): PlanGenerationResult {
+    const result = generatePlanWithDiagnostics(config, this.library, totalWeeks);
+    if (result.plan) {
+      this.plans.set(result.plan.id, result.plan);
+      this.currentVersion.set(result.plan.id, 0);
+      this.versions.set(result.plan.id, []);
+    }
+    return result;
   }
 
   getPlan(planId: string): TrainingPlan {
@@ -88,8 +105,8 @@ export class FitnessTrainingSDK {
     return this.library.findById(id);
   }
 
-  getExerciseReplacements(exerciseId: string): Exercise[] {
-    return this.library.getReplacements(exerciseId);
+  getExerciseReplacements(exerciseId: string, availableEquipment?: EquipmentCategory[]): Exercise[] {
+    return this.library.getReplacements(exerciseId, availableEquipment);
   }
 
   substituteExercise(
@@ -98,14 +115,19 @@ export class FitnessTrainingSDK {
     dayOfWeek: number,
     targetExerciseId: string,
     replacementId: string,
-  ): TrainingPlan {
+  ): SubstitutionResult {
     const plan = this.getPlan(planId);
 
-    const exerciseRefs = plan.weeks
-      .flatMap((w) => w.days)
-      .flatMap((d) => d.exercises)
-      .map((s) => ({ exerciseId: s.exerciseId }));
-    this.library.substitute(exerciseRefs, targetExerciseId, replacementId);
+    const targetEx = this.library.findById(targetExerciseId);
+    const replacementEx = this.library.findById(replacementId);
+
+    this.library.substitute(
+      plan.weeks.flatMap((w) => w.days).flatMap((d) => d.exercises).map((s) => ({ exerciseId: s.exerciseId })),
+      targetExerciseId,
+      replacementId,
+    );
+
+    const impact: SubstitutionImpact[] = [];
 
     const updatedPlan = {
       ...plan,
@@ -115,22 +137,47 @@ export class FitnessTrainingSDK {
           ...w,
           days: w.days.map((d) => {
             if (d.dayOfWeek !== dayOfWeek) return d;
-            return {
-              ...d,
-              exercises: d.exercises.map((s) =>
-                s.exerciseId === targetExerciseId
-                  ? { ...s, exerciseId: replacementId }
-                  : s,
-              ),
-            };
+            const affectedIndices: number[] = [];
+            const updatedExercises = d.exercises.map((s, idx) => {
+              if (s.exerciseId === targetExerciseId) {
+                affectedIndices.push(idx + 1);
+                return { ...s, exerciseId: replacementId };
+              }
+              return s;
+            });
+
+            if (affectedIndices.length > 0) {
+              impact.push({
+                weekNumber,
+                dayOfWeek,
+                dayLabel: d.label,
+                setIndices: affectedIndices,
+              });
+            }
+
+            return { ...d, exercises: updatedExercises };
           }),
         };
       }),
       updatedAt: new Date().toISOString(),
     };
 
+    this.saveVersion(planId, '替换动作：' + (targetEx ? targetEx.name : targetExerciseId) + ' -> ' + (replacementEx ? replacementEx.name : replacementId));
     this.plans.set(planId, updatedPlan);
-    return updatedPlan;
+
+    const availableReplacements = this.library.getReplacements(targetExerciseId);
+
+    return {
+      plan: updatedPlan,
+      replaced: {
+        targetExerciseId,
+        targetExerciseName: targetEx ? targetEx.name : targetExerciseId,
+        replacementExerciseId: replacementId,
+        replacementExerciseName: replacementEx ? replacementEx.name : replacementId,
+      },
+      impact,
+      availableReplacements,
+    };
   }
 
   getWarmupSuggestions(
@@ -181,6 +228,7 @@ export class FitnessTrainingSDK {
     }
 
     const result = adjustPlan(plan, feedback, this.library);
+    this.saveVersion(planId, '根据疲劳反馈调整计划');
     this.plans.set(planId, result.adjustedPlan);
     return result;
   }
@@ -198,6 +246,7 @@ export class FitnessTrainingSDK {
   convertPlanUnits(planId: string, targetUnit: UnitSystem): TrainingPlan {
     const plan = this.getPlan(planId);
     const converted = convertPlanUnits(plan, targetUnit);
+    this.saveVersion(planId, '切换单位为' + (targetUnit === 'metric' ? '公制' : '英制'));
     this.plans.set(planId, converted);
     return converted;
   }
@@ -229,6 +278,75 @@ export class FitnessTrainingSDK {
   getAllPlans(): TrainingPlan[] {
     return Array.from(this.plans.values());
   }
+
+  getPlanVersions(planId: string): PlanVersionSnapshot[] {
+    return this.versions.get(planId) ?? [];
+  }
+
+  getCurrentVersion(planId: string): number {
+    return this.currentVersion.get(planId) ?? 0;
+  }
+
+  rollbackToVersion(planId: string, version: number): TrainingPlan {
+    const versionList = this.versions.get(planId);
+    if (!versionList) throw new PlanNotFoundError(planId);
+
+    const snapshot = versionList.find((v) => v.version === version);
+    if (!snapshot) {
+      throw new FitnessSDKError('VERSION_NOT_FOUND', 'Version ' + version + ' not found for plan ' + planId);
+    }
+
+    this.plans.set(planId, { ...snapshot.plan });
+    this.saveVersion(planId, '回滚至版本' + version);
+    return this.getPlan(planId);
+  }
+
+  exportData(planId: string): ExportedData {
+    const plan = this.getPlan(planId);
+    const records = this.store.getRecordsByPlan(planId);
+    const feedbacks = this.store.getFeedbacksByPlan(planId);
+    const versions = this.versions.get(planId) ?? [];
+
+    return {
+      plan,
+      records,
+      feedbacks,
+      versions,
+      exportedAt: new Date().toISOString(),
+      sdkVersion: '1.0.0',
+    };
+  }
+
+  importData(data: ExportedData): void {
+    this.plans.set(data.plan.id, data.plan);
+    this.currentVersion.set(data.plan.id, data.plan.totalWeeks);
+    this.versions.set(data.plan.id, data.versions ?? []);
+
+    for (const record of data.records) {
+      this.store.recordCompletion(record);
+    }
+
+    for (const feedback of data.feedbacks) {
+      this.store.submitFatigueFeedback(feedback);
+    }
+  }
+
+  private saveVersion(planId: string, reason: string): void {
+    const plan = this.plans.get(planId);
+    if (!plan) return;
+
+    const ver = (this.currentVersion.get(planId) ?? 0) + 1;
+    this.currentVersion.set(planId, ver);
+
+    const versionList = this.versions.get(planId) ?? [];
+    versionList.push({
+      version: ver,
+      timestamp: new Date().toISOString(),
+      reason,
+      plan: JSON.parse(JSON.stringify(plan)),
+    });
+    this.versions.set(planId, versionList);
+  }
 }
 
 export * from './types';
@@ -238,7 +356,6 @@ export {
   InvalidConfigError,
   ExerciseNotFoundError,
   PlanNotFoundError,
-  RecordNotFoundError,
   SubstitutionError,
   DuplicateExerciseError,
   InvalidFeedbackError,

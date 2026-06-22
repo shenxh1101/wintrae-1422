@@ -160,10 +160,8 @@ export interface WeeklyReport {
   planId: string;
   weekNumber: number;
   completionRate: number;
-  totalVolume: number;
-  totalSets: number;
-  totalReps: number;
-  averageWeight: number;
+  planned: PlannedVsActual;
+  actual: PlannedVsActual;
   personalRecords: PersonalRecord[];
   muscleGroupDistribution: Partial<Record<MuscleGroup, number>>;
   fatigueTrend: FatigueLevel[];
@@ -188,6 +186,8 @@ export interface PlanProgress {
   currentStreak: number;
   totalWorkoutsCompleted: number;
   totalWorkoutsPlanned: number;
+  planned: PlannedVsActual;
+  actual: PlannedVsActual;
 }
 
 export interface PlanAdjustment {
@@ -227,3 +227,84 @@ export type WeightedExercise = {
   exerciseId: string;
   priority: number;
 };
+
+export interface PlanGenerationWarning {
+  type: 'exercise_filtered' | 'preferred_unavailable' | 'day_underpopulated';
+  message: string;
+  exerciseId?: string;
+  muscleGroups?: MuscleGroup[];
+  suggestedEquipment?: EquipmentCategory[];
+}
+
+export interface ExerciseAlternative {
+  originalExerciseId: string;
+  originalExerciseName: string;
+  reason: string;
+  alternatives: Exercise[];
+}
+
+export interface UnresolvableDay {
+  dayIndex: number;
+  label: string;
+  targetMuscleGroups: MuscleGroup[];
+  reason: string;
+  missingEquipment: EquipmentCategory[];
+  conflictingLimitations: string[];
+}
+
+export interface PlanGenerationResult {
+  plan: TrainingPlan | null;
+  warnings: PlanGenerationWarning[];
+  alternatives: ExerciseAlternative[];
+  unresolvableDays: UnresolvableDay[];
+  canProceed: boolean;
+  summary: string;
+}
+
+export interface SubstitutionImpact {
+  weekNumber: number;
+  dayOfWeek: number;
+  dayLabel: string;
+  setIndices: number[];
+}
+
+export interface SubstitutionResult {
+  plan: TrainingPlan;
+  replaced: {
+    targetExerciseId: string;
+    targetExerciseName: string;
+    replacementExerciseId: string;
+    replacementExerciseName: string;
+  };
+  impact: SubstitutionImpact[];
+  availableReplacements: Exercise[];
+}
+
+export interface PlannedVsActual {
+  plannedVolume: number;
+  plannedSets: number;
+  plannedReps: number;
+  plannedWorkouts: number;
+  actualVolume: number;
+  actualSets: number;
+  actualReps: number;
+  actualWorkouts: number;
+  completionRate: number;
+}
+
+export interface PlanVersionSnapshot {
+  version: number;
+  timestamp: string;
+  reason: string;
+  plan: TrainingPlan;
+}
+
+export interface ExportedData {
+  plan: TrainingPlan;
+  records: TrainingRecord[];
+  feedbacks: FatigueFeedback[];
+  versions: PlanVersionSnapshot[];
+  exportedAt: string;
+  sdkVersion: string;
+}
+

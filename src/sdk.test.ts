@@ -4,8 +4,10 @@ import {
   ExerciseNotFoundError,
   DuplicateExerciseError,
   InsufficientDaysError,
+  NoAvailableEquipmentError,
+  PlanNotFoundError,
 } from './errors';
-import { Exercise, WorkoutDay, ExerciseSet, EquipmentCategory } from './types';
+import { Exercise, WorkoutDay, ExerciseSet, EquipmentCategory, SubstitutionResult, PlanGenerationResult, ExportedData } from './types';
 
 describe('FitnessTrainingSDK', () => {
   let sdk: FitnessTrainingSDK;
@@ -131,6 +133,13 @@ describe('FitnessTrainingSDK', () => {
       expect(reps.length).toBeGreaterThan(0);
       expect(reps.some((r: Exercise) => r.id === 'goblet_squat')).toBe(true);
     });
+
+    test('should filter replacements by available equipment', () => {
+      const reps = sdk.getExerciseReplacements('barbell_squat', ['dumbbell', 'none']);
+      for (const r of reps) {
+        expect(r.equipment.some((eq) => eq === 'none' || eq === 'dumbbell')).toBe(true);
+      }
+    });
   });
 
   describe('Plan Generation', () => {
@@ -233,6 +242,129 @@ describe('FitnessTrainingSDK', () => {
         expect(plan.goal).toBe(goal);
         expect(plan.weeks.length).toBeGreaterThan(0);
       }
+    });
+  });
+
+  describe('Plan Generation with Diagnostics', () => {
+    const baseConfig = {
+      userId: 'user_diag',
+      goal: 'strength' as const,
+      availableDaysPerWeek: 3,
+      equipment: ['barbell', 'bench', 'dumbbell'] as EquipmentCategory[],
+      limitations: [] as any[],
+      preferredExerciseIds: [] as string[],
+      difficulty: 'intermediate' as const,
+    };
+
+    test('should return PlanGenerationResult with plan when equipment is sufficient', () => {
+      const result = sdk.generatePlanWithDiagnostics(baseConfig);
+      expect(result.plan).not.toBeNull();
+      expect(result.canProceed).toBe(true);
+      expect(result.warnings).toBeDefined();
+      expect(result.alternatives).toBeDefined();
+      expect(result.unresolvableDays).toBeDefined();
+      expect(result.summary).toBeDefined();
+      expect(typeof result.summary).toBe('string');
+    });
+
+    test('should return canProceed=true and no warnings for well-equipped config', () => {
+      const result = sdk.generatePlanWithDiagnostics(baseConfig);
+      expect(result.canProceed).toBe(true);
+    });
+
+    test('should produce warnings when preferred exercise is unavailable', () => {
+      const config = {
+        ...baseConfig,
+        equipment: ['none'] as EquipmentCategory[],
+        goal: 'endurance' as const,
+        preferredExerciseIds: ['barbell_squat', 'bench_press'],
+      };
+      const result = sdk.generatePlanWithDiagnostics(config);
+      const prefWarnings = result.warnings.filter((w) => w.type === 'preferred_unavailable');
+      expect(prefWarnings.length).toBeGreaterThan(0);
+      for (const w of prefWarnings) {
+        expect(w.exerciseId).toBeDefined();
+        expect(w.message).toContain('偏好动作');
+      }
+    });
+
+    test('should produce exercise_filtered warnings when equipment filters out exercises', () => {
+      const config = {
+        ...baseConfig,
+        equipment: ['none'] as EquipmentCategory[],
+        goal: 'endurance' as const,
+      };
+      const result = sdk.generatePlanWithDiagnostics(config);
+      const filteredWarnings = result.warnings.filter((w) => w.type === 'exercise_filtered');
+      expect(filteredWarnings.length).toBeGreaterThan(0);
+      for (const w of filteredWarnings) {
+        expect(w.suggestedEquipment).toBeDefined();
+      }
+    });
+
+    test('should produce alternatives for filtered exercises', () => {
+      const config = {
+        ...baseConfig,
+        equipment: ['none'] as EquipmentCategory[],
+        goal: 'endurance' as const,
+      };
+      const result = sdk.generatePlanWithDiagnostics(config);
+      if (result.alternatives.length > 0) {
+        const alt = result.alternatives[0];
+        expect(alt.originalExerciseId).toBeDefined();
+        expect(alt.originalExerciseName).toBeDefined();
+        expect(alt.reason).toBeDefined();
+        expect(alt.alternatives.length).toBeGreaterThan(0);
+      }
+    });
+
+    test('should return canProceed=false with unresolvableDays when no exercises available', () => {
+      const config = {
+        ...baseConfig,
+        equipment: ['smith_machine'] as EquipmentCategory[],
+      };
+      const result = sdk.generatePlanWithDiagnostics(config);
+      if (!result.canProceed) {
+        expect(result.plan).toBeNull();
+        expect(result.unresolvableDays.length).toBeGreaterThan(0);
+        for (const day of result.unresolvableDays) {
+          expect(day.dayIndex).toBeDefined();
+          expect(day.label).toBeDefined();
+          expect(day.targetMuscleGroups).toBeDefined();
+          expect(day.reason).toBeDefined();
+          expect(day.missingEquipment).toBeDefined();
+          expect(day.conflictingLimitations).toBeDefined();
+        }
+      }
+    });
+
+    test('should include suggested equipment in summary when days are unresolvable', () => {
+      const config = {
+        ...baseConfig,
+        equipment: ['smith_machine'] as EquipmentCategory[],
+      };
+      const result = sdk.generatePlanWithDiagnostics(config);
+      if (!result.canProceed) {
+        expect(result.summary).toContain('器械');
+      }
+    });
+
+    test('should throw NoAvailableEquipmentError from generatePlan when all exercises are blocked', () => {
+      const config = {
+        ...baseConfig,
+        equipment: ['resistance_band'] as EquipmentCategory[],
+        limitations: [
+          {
+            area: '全身',
+            severity: 'severe' as const,
+            movementsToAvoid: [
+              'bodyweight_squat', 'push_up', 'plank', 'dead_bug', 'bird_dog',
+              'glute_bridge', 'nordic_curl', 'lunge', 'calf_raise',
+            ],
+          },
+        ],
+      };
+      expect(() => sdk.generatePlan(config)).toThrow(NoAvailableEquipmentError);
     });
   });
 
@@ -406,41 +538,148 @@ describe('FitnessTrainingSDK', () => {
   });
 
   describe('Progress and Reports', () => {
-    test('should calculate progress', () => {
-      const config = {
-        userId: 'user_prog',
-        goal: 'strength' as const,
-        availableDaysPerWeek: 3,
-        equipment: ['barbell', 'bench'] as EquipmentCategory[],
-        limitations: [] as any[],
-        preferredExerciseIds: [] as string[],
-        difficulty: 'intermediate' as const,
-      };
-      const plan = sdk.generatePlan(config);
+    const makePlanConfig = (userId: string) => ({
+      userId,
+      goal: 'strength' as const,
+      availableDaysPerWeek: 3,
+      equipment: ['barbell', 'bench'] as EquipmentCategory[],
+      limitations: [] as any[],
+      preferredExerciseIds: [] as string[],
+      difficulty: 'intermediate' as const,
+    });
 
+    test('should calculate progress with planned and actual fields', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_prog'));
       const progress = sdk.getProgress(plan.id);
       expect(progress.planId).toBe(plan.id);
       expect(progress.totalWeeks).toBe(8);
       expect(progress.overallCompletionPercent).toBe(0);
+      expect(progress.planned).toBeDefined();
+      expect(progress.actual).toBeDefined();
     });
 
-    test('should generate weekly report', () => {
-      const config = {
-        userId: 'user_rpt',
-        goal: 'strength' as const,
-        availableDaysPerWeek: 3,
-        equipment: ['barbell', 'bench'] as EquipmentCategory[],
-        limitations: [] as any[],
-        preferredExerciseIds: [] as string[],
-        difficulty: 'intermediate' as const,
-      };
-      const plan = sdk.generatePlan(config);
+    test('should have actual=0 when no records exist', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_prog_empty'));
+      const progress = sdk.getProgress(plan.id);
+      expect(progress.actual.actualSets).toBe(0);
+      expect(progress.actual.actualVolume).toBe(0);
+      expect(progress.actual.actualReps).toBe(0);
+      expect(progress.actual.actualWorkouts).toBe(0);
+      expect(progress.actual.completionRate).toBe(0);
+    });
 
+    test('should have planned > 0 even without records', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_prog_plan'));
+      const progress = sdk.getProgress(plan.id);
+      expect(progress.planned.plannedSets).toBeGreaterThan(0);
+      expect(progress.planned.plannedWorkouts).toBeGreaterThan(0);
+    });
+
+    test('should reflect actual data after recording training', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_prog_rec'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      for (const set of trainingDay.exercises) {
+        sdk.recordTraining({
+          id: '',
+          planId: plan.id,
+          weekNumber: 1,
+          dayOfWeek: trainingDay.dayOfWeek,
+          exerciseId: set.exerciseId,
+          setIndex: set.setIndex,
+          actualReps: set.targetReps,
+          actualWeight: set.targetWeight,
+          completedAt: '',
+          restTakenSeconds: 90,
+        });
+      }
+
+      const progress = sdk.getProgress(plan.id);
+      expect(progress.actual.actualSets).toBeGreaterThan(0);
+      expect(progress.actual.actualVolume).toBeGreaterThan(0);
+    });
+
+    test('should generate weekly report with planned and actual', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt'));
       const report = sdk.getWeeklyReport(plan.id, 1);
       expect(report.planId).toBe(plan.id);
       expect(report.weekNumber).toBe(1);
-      expect(report.totalSets).toBeGreaterThanOrEqual(0);
+      expect(report.planned).toBeDefined();
+      expect(report.actual).toBeDefined();
       expect(report.recommendations.length).toBeGreaterThan(0);
+    });
+
+    test('should have actual all-zero in weekly report when no records', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt_empty'));
+      const report = sdk.getWeeklyReport(plan.id, 1);
+      expect(report.actual.actualSets).toBe(0);
+      expect(report.actual.actualVolume).toBe(0);
+      expect(report.actual.actualReps).toBe(0);
+      expect(report.actual.actualWorkouts).toBe(0);
+    });
+
+    test('should have planned > 0 in weekly report', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt_plan'));
+      const report = sdk.getWeeklyReport(plan.id, 1);
+      expect(report.planned.plannedSets).toBeGreaterThan(0);
+      expect(report.planned.plannedWorkouts).toBeGreaterThan(0);
+    });
+
+    test('should reflect actual data in weekly report after recording', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt_rec'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstSet = trainingDay.exercises[0];
+      sdk.recordTraining({
+        id: '',
+        planId: plan.id,
+        weekNumber: 1,
+        dayOfWeek: trainingDay.dayOfWeek,
+        exerciseId: firstSet.exerciseId,
+        setIndex: firstSet.setIndex,
+        actualReps: firstSet.targetReps,
+        actualWeight: firstSet.targetWeight,
+        completedAt: '',
+        restTakenSeconds: 90,
+      });
+
+      const report = sdk.getWeeklyReport(plan.id, 1);
+      expect(report.actual.actualSets).toBeGreaterThan(0);
+      expect(report.actual.actualVolume).toBeGreaterThan(0);
+      expect(report.completionRate).toBeGreaterThan(0);
+    });
+
+    test('should include fatigue trend in weekly report', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt_fatigue'));
+      sdk.submitFatigueFeedback({
+        planId: plan.id,
+        weekNumber: 1,
+        overallFatigue: 7,
+        sleepQuality: 6,
+        motivationLevel: 5,
+      });
+      const report = sdk.getWeeklyReport(plan.id, 1);
+      expect(report.fatigueTrend).toBeDefined();
+      expect(report.fatigueTrend.length).toBeGreaterThan(0);
+      expect(report.fatigueTrend).toContain(7);
+    });
+
+    test('should include personal records only from actual completed sets', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt_pr'));
+      const report = sdk.getWeeklyReport(plan.id, 1);
+      expect(report.personalRecords).toEqual([]);
+    });
+
+    test('should generate empty report for non-existent week', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt_empty_w'));
+      const report = sdk.getWeeklyReport(plan.id, 999);
+      expect(report.planned.plannedSets).toBe(0);
+      expect(report.actual.actualSets).toBe(0);
+      expect(report.completionRate).toBe(0);
     });
   });
 
@@ -454,18 +693,18 @@ describe('FitnessTrainingSDK', () => {
   });
 
   describe('Exercise Substitution in Plan', () => {
-    test('should substitute exercise in a plan', () => {
-      const config = {
-        userId: 'user_sub',
-        goal: 'strength' as const,
-        availableDaysPerWeek: 3,
-        equipment: ['barbell', 'bench', 'dumbbell'] as EquipmentCategory[],
-        limitations: [] as any[],
-        preferredExerciseIds: [] as string[],
-        difficulty: 'intermediate' as const,
-      };
-      const plan = sdk.generatePlan(config);
+    const makeConfig = (userId: string) => ({
+      userId,
+      goal: 'strength' as const,
+      availableDaysPerWeek: 3,
+      equipment: ['barbell', 'bench', 'dumbbell'] as EquipmentCategory[],
+      limitations: [] as any[],
+      preferredExerciseIds: [] as string[],
+      difficulty: 'intermediate' as const,
+    });
 
+    test('should substitute exercise and return SubstitutionResult', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub'));
       const week1 = plan.weeks[0];
       const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
       if (!trainingDay) return;
@@ -475,7 +714,7 @@ describe('FitnessTrainingSDK', () => {
       if (!exercise || exercise.replacementIds.length === 0) return;
 
       const replacementId = exercise.replacementIds[0];
-      const updated = sdk.substituteExercise(
+      const result = sdk.substituteExercise(
         plan.id,
         1,
         trainingDay.dayOfWeek,
@@ -483,8 +722,319 @@ describe('FitnessTrainingSDK', () => {
         replacementId,
       );
 
-      const updatedDay = updated.weeks[0].days.find((d: WorkoutDay) => d.dayOfWeek === trainingDay.dayOfWeek);
+      expect(result.plan).toBeDefined();
+      expect(result.replaced).toBeDefined();
+      expect(result.replaced.targetExerciseId).toBe(firstExerciseId);
+      expect(result.replaced.replacementExerciseId).toBe(replacementId);
+      expect(result.replaced.targetExerciseName).toBeDefined();
+      expect(result.replaced.replacementExerciseName).toBeDefined();
+    });
+
+    test('should track impact scope in substitution result', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub_impact'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstExerciseId = trainingDay.exercises[0].exerciseId;
+      const exercise = sdk.findExercise(firstExerciseId);
+      if (!exercise || exercise.replacementIds.length === 0) return;
+
+      const replacementId = exercise.replacementIds[0];
+      const result = sdk.substituteExercise(
+        plan.id,
+        1,
+        trainingDay.dayOfWeek,
+        firstExerciseId,
+        replacementId,
+      );
+
+      expect(result.impact).toBeDefined();
+      expect(Array.isArray(result.impact)).toBe(true);
+      if (result.impact.length > 0) {
+        const imp = result.impact[0];
+        expect(imp.weekNumber).toBe(1);
+        expect(imp.dayOfWeek).toBe(trainingDay.dayOfWeek);
+        expect(imp.dayLabel).toBeDefined();
+        expect(imp.setIndices.length).toBeGreaterThan(0);
+      }
+    });
+
+    test('should list available replacements in substitution result', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub_avail'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstExerciseId = trainingDay.exercises[0].exerciseId;
+      const exercise = sdk.findExercise(firstExerciseId);
+      if (!exercise || exercise.replacementIds.length === 0) return;
+
+      const replacementId = exercise.replacementIds[0];
+      const result = sdk.substituteExercise(
+        plan.id,
+        1,
+        trainingDay.dayOfWeek,
+        firstExerciseId,
+        replacementId,
+      );
+
+      expect(result.availableReplacements).toBeDefined();
+      expect(Array.isArray(result.availableReplacements)).toBe(true);
+    });
+
+    test('should actually replace exercise in the plan', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub_replace'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstExerciseId = trainingDay.exercises[0].exerciseId;
+      const exercise = sdk.findExercise(firstExerciseId);
+      if (!exercise || exercise.replacementIds.length === 0) return;
+
+      const replacementId = exercise.replacementIds[0];
+      const result = sdk.substituteExercise(
+        plan.id,
+        1,
+        trainingDay.dayOfWeek,
+        firstExerciseId,
+        replacementId,
+      );
+
+      const updatedDay = result.plan.weeks[0].days.find(
+        (d: WorkoutDay) => d.dayOfWeek === trainingDay.dayOfWeek,
+      );
       expect(updatedDay!.exercises.some((s: ExerciseSet) => s.exerciseId === replacementId)).toBe(true);
+    });
+  });
+
+  describe('Plan Versioning', () => {
+    const makeConfig = (userId: string) => ({
+      userId,
+      goal: 'strength' as const,
+      availableDaysPerWeek: 3,
+      equipment: ['barbell', 'bench', 'dumbbell'] as EquipmentCategory[],
+      limitations: [] as any[],
+      preferredExerciseIds: [] as string[],
+      difficulty: 'intermediate' as const,
+    });
+
+    test('should start with version 0 for new plan', () => {
+      const plan = sdk.generatePlan(makeConfig('user_ver_0'));
+      expect(sdk.getCurrentVersion(plan.id)).toBe(0);
+      expect(sdk.getPlanVersions(plan.id)).toEqual([]);
+    });
+
+    test('should increment version on substitution', () => {
+      const plan = sdk.generatePlan(makeConfig('user_ver_sub'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstExerciseId = trainingDay.exercises[0].exerciseId;
+      const exercise = sdk.findExercise(firstExerciseId);
+      if (!exercise || exercise.replacementIds.length === 0) return;
+
+      sdk.substituteExercise(plan.id, 1, trainingDay.dayOfWeek, firstExerciseId, exercise.replacementIds[0]);
+      expect(sdk.getCurrentVersion(plan.id)).toBe(1);
+      const versions = sdk.getPlanVersions(plan.id);
+      expect(versions.length).toBe(1);
+      expect(versions[0].version).toBe(1);
+      expect(versions[0].reason).toContain('替换动作');
+    });
+
+    test('should increment version on unit conversion', () => {
+      const plan = sdk.generatePlan(makeConfig('user_ver_unit'));
+      sdk.convertPlanUnits(plan.id, 'imperial');
+      expect(sdk.getCurrentVersion(plan.id)).toBe(1);
+      const versions = sdk.getPlanVersions(plan.id);
+      expect(versions[0].reason).toContain('单位');
+    });
+
+    test('should increment version on plan adjustment', () => {
+      const plan = sdk.generatePlan(makeConfig('user_ver_adj'));
+      sdk.submitFatigueFeedback({
+        planId: plan.id,
+        weekNumber: 1,
+        overallFatigue: 9,
+        sleepQuality: 3,
+        motivationLevel: 4,
+      });
+      sdk.adjustPlan(plan.id, 1);
+      const versions = sdk.getPlanVersions(plan.id);
+      expect(versions.some((v) => v.reason.includes('疲劳反馈'))).toBe(true);
+    });
+
+    test('should rollback to previous version', () => {
+      const plan = sdk.generatePlan(makeConfig('user_ver_rb'));
+      const originalGoal = plan.goal;
+
+      sdk.convertPlanUnits(plan.id, 'imperial');
+      expect(sdk.getCurrentVersion(plan.id)).toBe(1);
+
+      const rolledBack = sdk.rollbackToVersion(plan.id, 1);
+      expect(rolledBack).toBeDefined();
+      expect(rolledBack.goal).toBe(originalGoal);
+    });
+
+    test('should throw when rolling back to non-existent version', () => {
+      const plan = sdk.generatePlan(makeConfig('user_ver_bad'));
+      expect(() => sdk.rollbackToVersion(plan.id, 99)).toThrow();
+    });
+
+    test('should preserve version snapshot with full plan copy', () => {
+      const plan = sdk.generatePlan(makeConfig('user_ver_snap'));
+      sdk.convertPlanUnits(plan.id, 'imperial');
+      const versions = sdk.getPlanVersions(plan.id);
+      expect(versions[0].plan).toBeDefined();
+      expect(versions[0].plan.id).toBe(plan.id);
+      expect(versions[0].timestamp).toBeDefined();
+    });
+  });
+
+  describe('Import / Export', () => {
+    const makeConfig = (userId: string) => ({
+      userId,
+      goal: 'strength' as const,
+      availableDaysPerWeek: 3,
+      equipment: ['barbell', 'bench', 'dumbbell'] as EquipmentCategory[],
+      limitations: [] as any[],
+      preferredExerciseIds: [] as string[],
+      difficulty: 'intermediate' as const,
+    });
+
+    test('should export plan data with all required fields', () => {
+      const plan = sdk.generatePlan(makeConfig('user_exp'));
+      const exported = sdk.exportData(plan.id);
+
+      expect(exported.plan).toBeDefined();
+      expect(exported.plan.id).toBe(plan.id);
+      expect(exported.records).toBeDefined();
+      expect(exported.feedbacks).toBeDefined();
+      expect(exported.versions).toBeDefined();
+      expect(exported.exportedAt).toBeDefined();
+      expect(exported.sdkVersion).toBeDefined();
+    });
+
+    test('should export records and feedbacks', () => {
+      const plan = sdk.generatePlan(makeConfig('user_exp_rec'));
+      sdk.recordTraining({
+        id: '',
+        planId: plan.id,
+        weekNumber: 1,
+        dayOfWeek: 1,
+        exerciseId: 'bench_press',
+        setIndex: 1,
+        actualReps: 5,
+        actualWeight: 60,
+        completedAt: '',
+        restTakenSeconds: 120,
+      });
+      sdk.submitFatigueFeedback({
+        planId: plan.id,
+        weekNumber: 1,
+        overallFatigue: 6,
+        sleepQuality: 7,
+        motivationLevel: 8,
+      });
+
+      const exported = sdk.exportData(plan.id);
+      expect(exported.records.length).toBeGreaterThan(0);
+      expect(exported.feedbacks.length).toBeGreaterThan(0);
+    });
+
+    test('should export version history', () => {
+      const plan = sdk.generatePlan(makeConfig('user_exp_ver'));
+      sdk.convertPlanUnits(plan.id, 'imperial');
+      const exported = sdk.exportData(plan.id);
+      expect(exported.versions.length).toBeGreaterThan(0);
+    });
+
+    test('should import data and restore plan state', () => {
+      const plan = sdk.generatePlan(makeConfig('user_imp'));
+      sdk.recordTraining({
+        id: '',
+        planId: plan.id,
+        weekNumber: 1,
+        dayOfWeek: 1,
+        exerciseId: 'bench_press',
+        setIndex: 1,
+        actualReps: 5,
+        actualWeight: 60,
+        completedAt: '',
+        restTakenSeconds: 120,
+      });
+      sdk.submitFatigueFeedback({
+        planId: plan.id,
+        weekNumber: 1,
+        overallFatigue: 6,
+        sleepQuality: 7,
+        motivationLevel: 8,
+      });
+      sdk.convertPlanUnits(plan.id, 'imperial');
+
+      const exported = sdk.exportData(plan.id);
+      const json = JSON.stringify(exported);
+
+      const newSdk = new FitnessTrainingSDK();
+      const imported = JSON.parse(json) as ExportedData;
+      newSdk.importData(imported);
+
+      const restoredPlan = newSdk.getPlan(exported.plan.id);
+      expect(restoredPlan).toBeDefined();
+      expect(restoredPlan.id).toBe(plan.id);
+    });
+
+    test('should continue calculating progress after import', () => {
+      const plan = sdk.generatePlan(makeConfig('user_imp_prog'));
+      sdk.recordTraining({
+        id: '',
+        planId: plan.id,
+        weekNumber: 1,
+        dayOfWeek: 1,
+        exerciseId: 'bench_press',
+        setIndex: 1,
+        actualReps: 5,
+        actualWeight: 60,
+        completedAt: '',
+        restTakenSeconds: 120,
+      });
+
+      const exported = sdk.exportData(plan.id);
+      const json = JSON.stringify(exported);
+
+      const newSdk = new FitnessTrainingSDK();
+      newSdk.importData(JSON.parse(json));
+
+      const progress = newSdk.getProgress(exported.plan.id);
+      expect(progress).toBeDefined();
+      expect(progress.planId).toBe(exported.plan.id);
+    });
+
+    test('should generate weekly report after import', () => {
+      const plan = sdk.generatePlan(makeConfig('user_imp_rpt'));
+      sdk.submitFatigueFeedback({
+        planId: plan.id,
+        weekNumber: 1,
+        overallFatigue: 7,
+        sleepQuality: 6,
+        motivationLevel: 5,
+      });
+
+      const exported = sdk.exportData(plan.id);
+      const json = JSON.stringify(exported);
+
+      const newSdk = new FitnessTrainingSDK();
+      newSdk.importData(JSON.parse(json));
+
+      const report = newSdk.getWeeklyReport(exported.plan.id, 1);
+      expect(report).toBeDefined();
+      expect(report.fatigueTrend.length).toBeGreaterThan(0);
+    });
+
+    test('should throw PlanNotFoundError when exporting non-existent plan', () => {
+      expect(() => sdk.exportData('nonexistent_plan')).toThrow(PlanNotFoundError);
     });
   });
 });
