@@ -204,6 +204,7 @@ export function generateWeeklyReport(
     : [];
 
   const configNotes = generateConfigNotes(plan, week);
+  const substitutionNotes = generateSubstitutionNotes(plan, week, library);
 
   return {
     planId: plan.id,
@@ -237,6 +238,7 @@ export function generateWeeklyReport(
     recommendations,
     nextWeekPreview,
     configNotes,
+    substitutionNotes,
   };
 }
 
@@ -295,6 +297,7 @@ function emptyReport(planId: string, weekNumber: number): WeeklyReport {
     recommendations: ['暂无数据，完成训练后即可生成报告'],
     nextWeekPreview: [],
     configNotes: [],
+    substitutionNotes: [],
   };
 }
 
@@ -357,6 +360,83 @@ function generateConfigNotes(plan: TrainingPlan, week: TrainingWeek): string[] {
   const trainingDays = week.days.filter((d) => !d.isRestDay && d.exercises.length > 0).length;
   if (trainingDays < config.availableDaysPerWeek) {
     notes.push('本周实际训练' + trainingDays + '天，少于计划的' + config.availableDaysPerWeek + '天（部分训练日因条件不足转为休息日）');
+  }
+
+  return notes;
+}
+
+function generateSubstitutionNotes(
+  plan: TrainingPlan,
+  week: TrainingWeek,
+  library: ExerciseLibrary,
+): string[] {
+  const notes: string[] = [];
+  const config = plan.configSnapshot;
+  if (!config) return notes;
+
+  const availableEq = new Set(config.equipment ?? []);
+  const avoidedIds = new Set<string>();
+  if (config.limitations) {
+    for (const lim of config.limitations) {
+      for (const moveId of lim.movementsToAvoid) {
+        avoidedIds.add(moveId);
+      }
+    }
+  }
+
+  const weekExerciseIds = new Set<string>();
+  for (const day of week.days) {
+    for (const set of day.exercises) {
+      weekExerciseIds.add(set.exerciseId);
+    }
+  }
+
+  const equipmentSubstituted: { name: string; required: string[] }[] = [];
+  const limitationSubstituted: { name: string; lim: string }[] = [];
+
+  for (const id of weekExerciseIds) {
+    const ex = library.findById(id);
+    if (!ex) continue;
+    const matchesEquipment = ex.equipment.some(
+      (eq) => eq === 'none' || availableEq.has(eq),
+    );
+    if (!matchesEquipment) {
+      equipmentSubstituted.push({
+        name: ex.name,
+        required: ex.equipment.filter((e) => e !== 'none'),
+      });
+    }
+    if (avoidedIds.has(id)) {
+      const limMatch = (config.limitations ?? []).find((l) =>
+        l.movementsToAvoid.includes(id),
+      );
+      limitationSubstituted.push({
+        name: ex.name,
+        lim: limMatch ? limMatch.area + '（' + limMatch.severity + '）' : '未知限制',
+      });
+    }
+  }
+
+  if (equipmentSubstituted.length > 0) {
+    for (const item of equipmentSubstituted.slice(0, 3)) {
+      notes.push('动作' + item.name + '所需器械' + item.required.join('、') + '不在条件内，建议使用器械兼容的替代动作');
+    }
+    if (equipmentSubstituted.length > 3) {
+      notes.push('另有' + (equipmentSubstituted.length - 3) + '个动作因器械条件被推荐替换');
+    }
+  }
+
+  if (limitationSubstituted.length > 0) {
+    for (const item of limitationSubstituted.slice(0, 3)) {
+      notes.push('动作' + item.name + '属于' + item.lim + '范围内，建议替换为安全的替代动作');
+    }
+    if (limitationSubstituted.length > 3) {
+      notes.push('另有' + (limitationSubstituted.length - 3) + '个动作与身体限制冲突，请检查');
+    }
+  }
+
+  if (notes.length === 0) {
+    notes.push('本周计划中的所有动作均符合当前器械条件和身体限制');
   }
 
   return notes;

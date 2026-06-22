@@ -461,8 +461,10 @@ export function generatePlanWithDiagnostics(
   const trainingDaysInWeek = weeks[0].days.filter((d) => !d.isRestDay && d.exercises.length > 0).length;
   const canProceed = trainingDaysInWeek > 0;
 
+  const resolvableDays = trainingDaysInWeek;
+
   const summary = buildSummary(allWarnings, allUnresolvable, canProceed, config);
-  const remediationSuggestions = buildRemediationSuggestions(allUnresolvable, allWarnings, config);
+  const remediationSuggestions = buildRemediationSuggestions(allUnresolvable, allWarnings, config, resolvableDays);
 
   const configSnapshot: PlanConfigSnapshot = {
     goal: config.goal,
@@ -569,18 +571,26 @@ function buildRemediationSuggestions(
   unresolvable: UnresolvableDay[],
   warnings: PlanGenerationWarning[],
   config: UserConfig,
+  resolvableDays: number,
 ): RemediationSuggestion[] {
   const suggestions: RemediationSuggestion[] = [];
 
   const allMissingEquipment = [...new Set(unresolvable.flatMap((d) => d.missingEquipment))];
-  if (allMissingEquipment.length > 0) {
+  const filteredMissingFromWarnings = [...new Set(
+    warnings.filter((w) => w.type === 'exercise_filtered').flatMap((w) => w.suggestedEquipment ?? []),
+  )];
+  const combinedMissingEq = [...new Set([...allMissingEquipment, ...filteredMissingFromWarnings])];
+  const missingToAdd = combinedMissingEq.filter(
+    (eq) => eq !== 'none' && !config.equipment.includes(eq),
+  );
+  if (missingToAdd.length > 0) {
     suggestions.push({
       type: 'add_equipment',
-      description: '增加以下器械可解锁更多训练动作：' + allMissingEquipment.join('、'),
+      description: '增加以下器械可解锁更多训练动作：' + missingToAdd.join('、'),
       impact: '可增加' + unresolvable.length + '个训练日的可用动作',
-      missingEquipment: allMissingEquipment,
+      missingEquipment: missingToAdd,
       suggestedConfig: {
-        equipment: [...config.equipment, ...allMissingEquipment],
+        equipment: [...config.equipment, ...missingToAdd],
       },
     });
   }
@@ -590,46 +600,59 @@ function buildRemediationSuggestions(
     const relaxedLimitations = config.limitations.map((lim) => ({
       ...lim,
       movementsToAvoid: lim.movementsToAvoid.filter((m) => !allConflictingLimitations.includes(m)),
-    })).filter((lim) => lim.movementsToAvoid.length < (config.limitations?.find((l) => l.area === lim.area)?.movementsToAvoid.length ?? 0));
-    suggestions.push({
-      type: 'relax_limitation',
-      description: '放宽对 ' + allConflictingLimitations.join('、') + ' 的限制后可安排更多动作',
-      impact: '增加可用动作，丰富训练多样性',
-      limitationToRelax: allConflictingLimitations[0],
-      suggestedConfig: {
-        limitations: config.limitations.map((lim) => ({
-          ...lim,
-          movementsToAvoid: lim.movementsToAvoid.filter((m) => !allConflictingLimitations.includes(m)),
-        })),
-      },
-    });
+    }));
+    const changesSomething = relaxedLimitations.some(
+      (lim, i) => lim.movementsToAvoid.length !== (config.limitations?.[i]?.movementsToAvoid.length ?? 0),
+    );
+    if (changesSomething) {
+      suggestions.push({
+        type: 'relax_limitation',
+        description: '放宽对 ' + allConflictingLimitations.join('、') + ' 的限制后可安排更多动作',
+        impact: '增加可用动作，丰富训练多样性',
+        limitationToRelax: allConflictingLimitations[0],
+        suggestedConfig: {
+          limitations: relaxedLimitations,
+        },
+      });
+    }
   }
 
   const preferredUnavailable = warnings.filter((w) => w.type === 'preferred_unavailable');
   if (preferredUnavailable.length > 0) {
     const prefEquip = [...new Set(preferredUnavailable.flatMap((w) => w.suggestedEquipment ?? []))];
-    if (prefEquip.length > 0) {
+    const prefToAdd = prefEquip.filter(
+      (eq) => eq !== 'none' && !config.equipment.includes(eq),
+    );
+    if (prefToAdd.length > 0) {
       suggestions.push({
         type: 'add_equipment',
-        description: '增加以下器械可使用偏好动作：' + prefEquip.join('、'),
+        description: '增加以下器械可使用偏好动作：' + prefToAdd.join('、'),
         impact: '提升训练体验和依从性',
-        missingEquipment: prefEquip,
+        missingEquipment: prefToAdd,
         suggestedConfig: {
-          equipment: [...config.equipment, ...prefEquip],
+          equipment: [...config.equipment, ...prefToAdd],
         },
       });
     }
   }
 
   const minDays = MIN_DAYS_BY_GOAL[config.goal];
-  if (unresolvable.length > 0 && config.availableDaysPerWeek > minDays) {
+  let targetDays = minDays;
+  if (resolvableDays > 0 && resolvableDays < config.availableDaysPerWeek && resolvableDays >= minDays) {
+    targetDays = resolvableDays;
+  }
+  const needReduce = (unresolvable.length > 0 || resolvableDays < config.availableDaysPerWeek)
+    && config.availableDaysPerWeek > targetDays
+    && targetDays >= minDays;
+
+  if (needReduce) {
     suggestions.push({
       type: 'reduce_days',
-      description: '可降级为每周' + minDays + '天训练，确保所有训练日都有充足动作',
+      description: '可降级为每周' + targetDays + '天训练（当前真正能安排' + resolvableDays + '天），确保所有训练日都有充足动作',
       impact: '训练更聚焦，避免无动作的空训练日',
-      reducedDays: minDays,
+      reducedDays: targetDays,
       suggestedConfig: {
-        availableDaysPerWeek: minDays,
+        availableDaysPerWeek: targetDays,
       },
     });
   }

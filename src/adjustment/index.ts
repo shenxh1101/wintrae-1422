@@ -38,6 +38,7 @@ export function adjustPlan(
         weekNumber: feedback.weekNumber + 1,
         adjustments: [],
         reason: 'No further weeks to adjust',
+        complianceNotes: [],
       },
     };
   }
@@ -119,6 +120,7 @@ export function adjustPlan(
       weekNumber: feedback.weekNumber + 1,
       adjustments: actions,
       reason,
+      complianceNotes: [],
     },
   };
 }

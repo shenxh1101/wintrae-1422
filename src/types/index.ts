@@ -169,6 +169,7 @@ export interface WeeklyReport {
   recommendations: string[];
   nextWeekPreview: WorkoutDay[];
   configNotes: string[];
+  substitutionNotes: string[];
 }
 
 export interface PersonalRecord {
@@ -197,6 +198,7 @@ export interface PlanAdjustment {
   weekNumber: number;
   adjustments: AdjustmentAction[];
   reason: string;
+  complianceNotes: string[];
 }
 
 export interface AdjustmentAction {
@@ -325,10 +327,14 @@ export interface PlanConfigSnapshot {
 }
 
 export interface SubstitutionPreview {
+  previewId: string;
   targetExerciseId: string;
   targetExerciseName: string;
   replacementExerciseId: string;
   replacementExerciseName: string;
+  planId: string;
+  weekNumber: number;
+  dayOfWeek: number;
   isValid: boolean;
   validationErrors: string[];
   impact: SubstitutionImpact[];

@@ -8,7 +8,7 @@ import {
   PlanNotFoundError,
   SubstitutionError,
 } from './errors';
-import { Exercise, WorkoutDay, ExerciseSet, EquipmentCategory, SubstitutionResult, PlanGenerationResult, ExportedData, SubstitutionPreview, SubstitutionCandidate } from './types';
+import { Exercise, WorkoutDay, ExerciseSet, EquipmentCategory, SubstitutionResult, PlanGenerationResult, ExportedData, SubstitutionPreview, SubstitutionCandidate, ImportConflictStrategy } from './types';
 
 describe('FitnessTrainingSDK', () => {
   let sdk: FitnessTrainingSDK;
@@ -397,6 +397,53 @@ describe('FitnessTrainingSDK', () => {
       }
     });
 
+    test('should produce reduce_days based on actual resolvable days', () => {
+      const config = {
+        ...baseConfig,
+        availableDaysPerWeek: 5,
+        equipment: ['dumbbell', 'none'] as EquipmentCategory[],
+        goal: 'general_fitness' as const,
+      };
+      const result = sdk.generatePlanWithDiagnostics(config);
+      if (!result.plan) return;
+      const week1TrainingDays = result.plan.weeks[0].days.filter(
+        (d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0,
+      ).length;
+      if (week1TrainingDays < 5) {
+        const reduceSug = result.remediationSuggestions.find((s) => s.type === 'reduce_days');
+        if (reduceSug) {
+          expect(reduceSug.suggestedConfig).toBeDefined();
+          expect(reduceSug.description).toContain('真正能安排' + week1TrainingDays + '天');
+        }
+      }
+    });
+
+    test('all three remediation types produce directly executable suggestedConfig', () => {
+      const config = {
+        ...baseConfig,
+        availableDaysPerWeek: 5,
+        equipment: ['kettlebell'] as EquipmentCategory[],
+        limitations: [
+          {
+            area: '全身',
+            severity: 'severe' as const,
+            movementsToAvoid: [
+              'bodyweight_squat', 'push_up', 'plank', 'dead_bug', 'bird_dog',
+            ],
+          },
+        ],
+        goal: 'general_fitness' as const,
+      };
+      const result = sdk.generatePlanWithDiagnostics(config);
+      const types = new Set(result.remediationSuggestions.map((s) => s.type));
+      for (const t of types) {
+        if (t === 'add_equipment' || t === 'reduce_days' || t === 'relax_limitation') {
+          const sug = result.remediationSuggestions.find((x) => x.type === t)!;
+          expect(sug.suggestedConfig).toBeDefined();
+        }
+      }
+    });
+
     test('should not include empty exercise days in executable plan', () => {
       const plan = sdk.generatePlan(baseConfig);
       const allDays = plan.weeks.flatMap((w) => w.days);
@@ -603,6 +650,53 @@ describe('FitnessTrainingSDK', () => {
 
       const result = sdk.adjustPlan(plan.id, 1);
       expect(result.adjustment.reason).toContain('正常');
+      expect(result.adjustment.complianceNotes).toBeDefined();
+      expect(Array.isArray(result.adjustment.complianceNotes)).toBe(true);
+    });
+
+    test('should include compliance notes about original limitations', () => {
+      const config = {
+        userId: 'user_adj_comp',
+        goal: 'strength' as const,
+        availableDaysPerWeek: 3,
+        equipment: ['barbell', 'bench', 'dumbbell'] as EquipmentCategory[],
+        limitations: [
+          { area: '下背', severity: 'moderate' as const, movementsToAvoid: ['deadlift', 'barbell_squat'] },
+        ],
+        preferredExerciseIds: [] as string[],
+        difficulty: 'intermediate' as const,
+      };
+      const plan = sdk.generatePlan(config);
+
+      sdk.submitFatigueFeedback({
+        planId: plan.id,
+        weekNumber: 1,
+        overallFatigue: 2,
+        sleepQuality: 6,
+        motivationLevel: 7,
+      });
+
+      const result = sdk.adjustPlan(plan.id, 1);
+      expect(result.adjustment.complianceNotes).toBeDefined();
+      const hasLimitNote = result.adjustment.complianceNotes.some(
+        (n) => n.includes('限制') || n.includes('受限动作') || n.includes('身体限制'),
+      );
+      expect(hasLimitNote).toBe(true);
+    });
+
+    test('should include compliance notes even with no feedback', () => {
+      const config = {
+        userId: 'user_adj_nofb',
+        goal: 'strength' as const,
+        availableDaysPerWeek: 3,
+        equipment: ['barbell', 'bench'] as EquipmentCategory[],
+        limitations: [] as any[],
+        preferredExerciseIds: [] as string[],
+        difficulty: 'intermediate' as const,
+      };
+      const plan = sdk.generatePlan(config);
+      const result = sdk.adjustPlan(plan.id, 1);
+      expect(result.adjustment.complianceNotes.length).toBeGreaterThan(0);
     });
   });
 
@@ -764,6 +858,21 @@ describe('FitnessTrainingSDK', () => {
       const hasEquipmentNote = report.configNotes.some((n) => n.includes('器械') || n.includes('徒手'));
       expect(hasEquipmentNote).toBe(true);
     });
+
+    test('should include substitutionNotes in weekly report', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt_sub'));
+      const report = sdk.getWeeklyReport(plan.id, 1);
+      expect(report.substitutionNotes).toBeDefined();
+      expect(Array.isArray(report.substitutionNotes)).toBe(true);
+      expect(report.substitutionNotes.length).toBeGreaterThan(0);
+    });
+
+    test('substitutionNotes should confirm all actions comply when no conflicts', () => {
+      const plan = sdk.generatePlan(makePlanConfig('user_rpt_sub_ok'));
+      const report = sdk.getWeeklyReport(plan.id, 1);
+      const hasCompliant = report.substitutionNotes.some((n) => n.includes('符合') || n.includes('所有动作'));
+      expect(hasCompliant).toBe(true);
+    });
   });
 
   describe('Templates', () => {
@@ -786,7 +895,7 @@ describe('FitnessTrainingSDK', () => {
       difficulty: 'intermediate' as const,
     });
 
-    test('should preview substitution with impact, validation and reason', () => {
+    test('should preview substitution with impact, validation, reason and previewId', () => {
       const plan = sdk.generatePlan(makeConfig('user_sub_pre'));
       const week1 = plan.weeks[0];
       const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
@@ -805,6 +914,11 @@ describe('FitnessTrainingSDK', () => {
         replacementId,
       );
 
+      expect(preview.previewId).toBeDefined();
+      expect(preview.previewId.startsWith('prev_')).toBe(true);
+      expect(preview.planId).toBe(plan.id);
+      expect(preview.weekNumber).toBe(1);
+      expect(preview.dayOfWeek).toBe(trainingDay.dayOfWeek);
       expect(preview.targetExerciseId).toBe(firstExerciseId);
       expect(preview.replacementExerciseId).toBe(replacementId);
       expect(preview.isValid).toBe(true);
@@ -813,6 +927,47 @@ describe('FitnessTrainingSDK', () => {
       expect(Array.isArray(preview.risks)).toBe(true);
       expect(Array.isArray(preview.benefits)).toBe(true);
       expect(typeof preview.reason).toBe('string');
+    });
+
+    test('should return isValid=false with clear errors when exercise not on the day', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub_not_on_day'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const restDay = week1.days.find((d: WorkoutDay) => d.isRestDay);
+      if (restDay) {
+        const preview = sdk.previewSubstitution(plan.id, 1, restDay.dayOfWeek, 'bench_press', 'push_up');
+        expect(preview.isValid).toBe(false);
+        expect(preview.validationErrors.some((m) => m.includes('休息日'))).toBe(true);
+      }
+
+      const wrongExercise = 'nonexistent_exercise_id';
+      const preview2 = sdk.previewSubstitution(plan.id, 1, trainingDay.dayOfWeek, wrongExercise, 'push_up');
+      expect(preview2.isValid).toBe(false);
+      const hasNotInDay = preview2.validationErrors.some((m) => m.includes('不在') || m.includes('不存在'));
+      expect(hasNotInDay).toBe(true);
+    });
+
+    test('should throw when confirming with invalid/expired preview token', () => {
+      const fakePreview: SubstitutionPreview = {
+        previewId: 'prev_fake_token_123',
+        planId: 'plan_fake',
+        weekNumber: 1,
+        dayOfWeek: 1,
+        targetExerciseId: 'bench_press',
+        targetExerciseName: '卧推',
+        replacementExerciseId: 'push_up',
+        replacementExerciseName: '俯卧撑',
+        isValid: true,
+        validationErrors: [],
+        impact: [],
+        risks: [],
+        benefits: [],
+        reason: '',
+      };
+      expect(() => sdk.confirmSubstitution(fakePreview)).toThrow(SubstitutionError);
+      expect(() => sdk.confirmSubstitution(fakePreview)).toThrow(/凭证/);
     });
 
     test('should return isValid=false for substitution with unavailable equipment', () => {
@@ -888,8 +1043,12 @@ describe('FitnessTrainingSDK', () => {
       }
     });
 
-    test('should reject confirmSubstitution with invalid preview', () => {
+    test('should reject confirmSubstitution with invalid preview (failed device check)', () => {
       const invalidPreview: SubstitutionPreview = {
+        previewId: 'prev_fake_invalid',
+        planId: 'plan_fake',
+        weekNumber: 1,
+        dayOfWeek: 1,
         targetExerciseId: 'bench_press',
         targetExerciseName: '卧推',
         replacementExerciseId: 'kettlebell_swing',
@@ -902,6 +1061,24 @@ describe('FitnessTrainingSDK', () => {
         reason: '',
       };
       expect(() => sdk.confirmSubstitution(invalidPreview)).toThrow(SubstitutionError);
+    });
+
+    test('should reject confirmSubstitution when content mismatches stored token', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub_mismatch'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstExerciseId = trainingDay.exercises[0].exerciseId;
+      const candidates = sdk.getSubstitutionCandidates(plan.id, 1, trainingDay.dayOfWeek, firstExerciseId);
+      if (candidates.length === 0) return;
+      const validCandidate = candidates.find((c) => c.preview.isValid) ?? candidates[0];
+      const tampered: SubstitutionPreview = {
+        ...validCandidate.preview,
+        replacementExerciseId: 'totally_wrong_exercise',
+      };
+      expect(() => sdk.confirmSubstitution(tampered)).toThrow(SubstitutionError);
+      expect(() => sdk.confirmSubstitution(tampered)).toThrow(/不匹配/);
     });
 
     test('should substitute exercise and return SubstitutionResult', () => {
@@ -1175,10 +1352,10 @@ describe('FitnessTrainingSDK', () => {
       const newSdk = new FitnessTrainingSDK();
       newSdk.importData(JSON.parse(json));
 
-      expect(newSdk.getCurrentVersion(exported.plan.id)).toBe(2);
+      expect(newSdk.getCurrentVersion(exported.plan.id)).toBe(3);
 
       newSdk.convertPlanUnits(exported.plan.id, 'imperial');
-      expect(newSdk.getCurrentVersion(exported.plan.id)).toBe(3);
+      expect(newSdk.getCurrentVersion(exported.plan.id)).toBe(4);
     });
 
     test('should keep_both when importing existing plan', () => {
@@ -1236,6 +1413,72 @@ describe('FitnessTrainingSDK', () => {
       for (const v of versions) {
         expect(v.actionType).toBeDefined();
       }
+    });
+
+    test('all three import strategies should record import in version timeline', () => {
+      const plan = sdk.generatePlan(makeConfig('user_imp_strat'));
+      sdk.convertPlanUnits(plan.id, 'imperial');
+      const exported = sdk.exportData(plan.id);
+
+      const strategies: Array<{ strategy: ImportConflictStrategy; label: string }> = [
+        { strategy: 'overwrite', label: '覆盖' },
+        { strategy: 'keep_both', label: '保留副本' },
+        { strategy: 'merge', label: '合并' },
+      ];
+
+      for (const { strategy, label } of strategies) {
+        const testSdk = new FitnessTrainingSDK();
+        testSdk.importData(exported);
+        const reimported = testSdk.importData(exported, { strategy });
+
+        const targetId = reimported.id;
+        const versions = testSdk.getPlanVersions(targetId);
+        const hasImport = versions.some((v) => v.actionType === 'import');
+        expect(hasImport).toBe(true);
+        const importVersion = versions.find((v) => v.actionType === 'import')!;
+        expect(importVersion.reason).toContain('导入');
+      }
+    });
+
+    test('keep_both strategy should not wipe original plan and produce separate copy with its own records', () => {
+      const config = makeConfig('user_imp_kb_pres');
+      const plan = sdk.generatePlan(config);
+      const originalPlanId = plan.id;
+
+      sdk.recordTraining({
+        id: '',
+        planId: plan.id,
+        weekNumber: 1,
+        dayOfWeek: 1,
+        exerciseId: plan.weeks[0].days.find((d) => !d.isRestDay && d.exercises.length > 0)!.exercises[0].exerciseId,
+        setIndex: 1,
+        actualReps: 10,
+        actualWeight: 50,
+        completedAt: '',
+        restTakenSeconds: 90,
+      });
+      sdk.submitFatigueFeedback({
+        planId: plan.id,
+        weekNumber: 1,
+        overallFatigue: 6,
+        sleepQuality: 6,
+        motivationLevel: 7,
+      });
+
+      const exported = sdk.exportData(plan.id);
+      const importedRecordsCount = exported.records.length;
+
+      const importedPlan = sdk.importData(exported, { strategy: 'keep_both' });
+
+      expect(importedPlan.id).not.toBe(originalPlanId);
+      expect(sdk.getAllPlans().length).toBeGreaterThanOrEqual(2);
+
+      const originalStillExists = sdk.getAllPlans().some((p) => p.id === originalPlanId);
+      expect(originalStillExists).toBe(true);
+
+      const importedRecords = sdk.exportData(importedPlan.id).records;
+      expect(importedRecords.length).toBe(importedRecordsCount);
+      expect(importedRecords.every((r) => r.planId === importedPlan.id)).toBe(true);
     });
   });
 });

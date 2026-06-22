@@ -55,6 +55,7 @@ export class FitnessTrainingSDK {
   private plans: Map<string, TrainingPlan> = new Map();
   private versions: Map<string, PlanVersionSnapshot[]> = new Map();
   private currentVersion: Map<string, number> = new Map();
+  private substitutionPreviews: Map<string, SubstitutionPreview> = new Map();
 
   constructor() {
     this.library = new ExerciseLibrary();
@@ -131,6 +132,10 @@ export class FitnessTrainingSDK {
     return this.library.getReplacements(exerciseId, availableEquipment);
   }
 
+  private generatePreviewId(): string {
+    return 'prev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+  }
+
   previewSubstitution(
     planId: string,
     weekNumber: number,
@@ -141,10 +146,35 @@ export class FitnessTrainingSDK {
     const plan = this.getPlan(planId);
     const config = plan.configSnapshot;
 
+    const previewId = this.generatePreviewId();
+    const validationErrors: string[] = [];
+
+    const week = plan.weeks.find((w) => w.weekNumber === weekNumber);
+    if (!week) {
+      validationErrors.push('第' + weekNumber + '周不存在');
+    }
+
+    let targetDay: { exercises: { exerciseId: string }[]; label: string } | undefined;
+    if (week) {
+      const d = week.days.find((x) => x.dayOfWeek === dayOfWeek);
+      if (!d) {
+        validationErrors.push('第' + weekNumber + '周第' + dayOfWeek + '天不存在');
+      } else if (d.isRestDay) {
+        validationErrors.push('第' + weekNumber + '周第' + dayOfWeek + '天是休息日，不包含任何动作');
+      } else {
+        targetDay = d;
+      }
+    }
+
+    if (targetDay) {
+      const hasExercise = targetDay.exercises.some((s) => s.exerciseId === targetExerciseId);
+      if (!hasExercise) {
+        validationErrors.push('动作' + targetExerciseId + '不在第' + weekNumber + '周第' + dayOfWeek + '天的计划中');
+      }
+    }
+
     const targetEx = this.library.findById(targetExerciseId);
     const replacementEx = this.library.findById(replacementId);
-
-    const validationErrors: string[] = [];
 
     if (!targetEx) {
       validationErrors.push('原动作不存在：' + targetExerciseId);
@@ -180,21 +210,21 @@ export class FitnessTrainingSDK {
     }
 
     const impact: SubstitutionImpact[] = [];
-    for (const week of plan.weeks) {
-      if (week.weekNumber < weekNumber) continue;
-      const day = week.days.find((d) => d.dayOfWeek === dayOfWeek);
-      if (day) {
+    for (const w of plan.weeks) {
+      if (w.weekNumber < weekNumber) continue;
+      const d = w.days.find((x) => x.dayOfWeek === dayOfWeek);
+      if (d && !d.isRestDay) {
         const affectedIndices: number[] = [];
-        day.exercises.forEach((s, idx) => {
+        d.exercises.forEach((s, idx) => {
           if (s.exerciseId === targetExerciseId) {
             affectedIndices.push(idx + 1);
           }
         });
         if (affectedIndices.length > 0) {
           impact.push({
-            weekNumber: week.weekNumber,
+            weekNumber: w.weekNumber,
             dayOfWeek,
-            dayLabel: day.label,
+            dayLabel: d.label,
             setIndices: affectedIndices,
           });
         }
@@ -239,11 +269,15 @@ export class FitnessTrainingSDK {
       }
     }
 
-    return {
+    const preview: SubstitutionPreview = {
+      previewId,
       targetExerciseId,
       targetExerciseName: targetEx ? targetEx.name : targetExerciseId,
       replacementExerciseId: replacementId,
       replacementExerciseName: replacementEx ? replacementEx.name : replacementId,
+      planId,
+      weekNumber,
+      dayOfWeek,
       isValid: validationErrors.length === 0,
       validationErrors,
       impact,
@@ -251,6 +285,9 @@ export class FitnessTrainingSDK {
       benefits,
       reason,
     };
+
+    this.substitutionPreviews.set(previewId, preview);
+    return preview;
   }
 
   getSubstitutionCandidates(
@@ -263,6 +300,12 @@ export class FitnessTrainingSDK {
     const config = plan.configSnapshot;
     const targetEx = this.library.findById(targetExerciseId);
     if (!targetEx) return [];
+
+    const week = plan.weeks.find((w) => w.weekNumber === weekNumber);
+    if (!week) return [];
+    const day = week.days.find((d) => d.dayOfWeek === dayOfWeek);
+    if (!day || day.isRestDay) return [];
+    if (!day.exercises.some((s) => s.exerciseId === targetExerciseId)) return [];
 
     const avoidedIds = new Set<string>();
     if (config.limitations) {
@@ -285,49 +328,64 @@ export class FitnessTrainingSDK {
   }
 
   confirmSubstitution(preview: SubstitutionPreview): SubstitutionResult {
-    if (!preview.isValid) {
+    const stored = this.substitutionPreviews.get(preview.previewId);
+    if (!stored) {
       throw new SubstitutionError(
         preview.targetExerciseId,
-        '替换未通过校验：' + preview.validationErrors.join('；'),
+        '预览凭证无效或已过期，请重新获取替换候选列表',
       );
     }
 
-    const planId = this.findPlanIdByExercise(preview.targetExerciseId, preview.impact);
-    if (!planId) {
-      throw new SubstitutionError(preview.targetExerciseId, '找不到对应的训练计划');
+    if (stored.targetExerciseId !== preview.targetExerciseId ||
+        stored.replacementExerciseId !== preview.replacementExerciseId ||
+        stored.planId !== preview.planId ||
+        stored.weekNumber !== preview.weekNumber ||
+        stored.dayOfWeek !== preview.dayOfWeek) {
+      throw new SubstitutionError(
+        preview.targetExerciseId,
+        '预览内容与凭证不匹配，请重新获取替换候选列表',
+      );
     }
+
+    if (!stored.isValid) {
+      throw new SubstitutionError(
+        stored.targetExerciseId,
+        '替换未通过校验：' + stored.validationErrors.join('；'),
+      );
+    }
+
+    const plan = this.plans.get(stored.planId);
+    if (!plan) {
+      throw new SubstitutionError(stored.targetExerciseId, '对应的训练计划不存在');
+    }
+
+    const week = plan.weeks.find((w) => w.weekNumber === stored.weekNumber);
+    if (!week) {
+      throw new SubstitutionError(stored.targetExerciseId, '第' + stored.weekNumber + '周不存在');
+    }
+    const day = week.days.find((d) => d.dayOfWeek === stored.dayOfWeek);
+    if (!day) {
+      throw new SubstitutionError(stored.targetExerciseId, '第' + stored.weekNumber + '周第' + stored.dayOfWeek + '天不存在');
+    }
+    if (day.isRestDay) {
+      throw new SubstitutionError(stored.targetExerciseId, '指定训练日是休息日，无法执行替换');
+    }
+    if (!day.exercises.some((s) => s.exerciseId === stored.targetExerciseId)) {
+      throw new SubstitutionError(
+        stored.targetExerciseId,
+        '动作 ' + stored.targetExerciseId + ' 不在第' + stored.weekNumber + '周第' + stored.dayOfWeek + '天，可能已被替换',
+      );
+    }
+
+    this.substitutionPreviews.delete(stored.previewId);
 
     return this.substituteExercise(
-      planId,
-      preview.impact[0].weekNumber,
-      preview.impact[0].dayOfWeek,
-      preview.targetExerciseId,
-      preview.replacementExerciseId,
+      stored.planId,
+      stored.weekNumber,
+      stored.dayOfWeek,
+      stored.targetExerciseId,
+      stored.replacementExerciseId,
     );
-  }
-
-  private findPlanIdByExercise(exerciseId: string, impact: SubstitutionImpact[]): string | null {
-    for (const [planId, plan] of this.plans) {
-      if (impact.length > 0) {
-        const week = plan.weeks.find((w) => w.weekNumber === impact[0].weekNumber);
-        if (week) {
-          const day = week.days.find((d) => d.dayOfWeek === impact[0].dayOfWeek);
-          if (day && day.exercises.some((s) => s.exerciseId === exerciseId)) {
-            return planId;
-          }
-        }
-      }
-    }
-    for (const [planId, plan] of this.plans) {
-      for (const week of plan.weeks) {
-        for (const day of week.days) {
-          if (day.exercises.some((s) => s.exerciseId === exerciseId)) {
-            return planId;
-          }
-        }
-      }
-    }
-    return null;
   }
 
   substituteExercise(
@@ -337,12 +395,27 @@ export class FitnessTrainingSDK {
     targetExerciseId: string,
     replacementId: string,
   ): SubstitutionResult {
+    const plan = this.getPlan(planId);
+
+    const week = plan.weeks.find((w) => w.weekNumber === weekNumber);
+    if (!week) {
+      throw new SubstitutionError(targetExerciseId, '第' + weekNumber + '周不存在');
+    }
+    const day = week.days.find((d) => d.dayOfWeek === dayOfWeek);
+    if (!day) {
+      throw new SubstitutionError(targetExerciseId, '第' + weekNumber + '周第' + dayOfWeek + '天不存在');
+    }
+    if (day.isRestDay || !day.exercises.some((s) => s.exerciseId === targetExerciseId)) {
+      throw new SubstitutionError(
+        targetExerciseId,
+        '动作 ' + targetExerciseId + ' 不在指定训练日中，无法替换',
+      );
+    }
+
     const preview = this.previewSubstitution(planId, weekNumber, dayOfWeek, targetExerciseId, replacementId);
     if (!preview.isValid) {
       throw new SubstitutionError(targetExerciseId, preview.validationErrors.join('；'));
     }
-
-    const plan = this.getPlan(planId);
 
     const targetEx = this.library.findById(targetExerciseId);
     const replacementEx = this.library.findById(replacementId);
@@ -354,6 +427,7 @@ export class FitnessTrainingSDK {
     );
 
     const impact: SubstitutionImpact[] = [];
+    let actuallyChanged = false;
 
     const updatedPlan = {
       ...plan,
@@ -367,6 +441,7 @@ export class FitnessTrainingSDK {
             const updatedExercises = d.exercises.map((s, idx) => {
               if (s.exerciseId === targetExerciseId) {
                 affectedIndices.push(idx + 1);
+                actuallyChanged = true;
                 return { ...s, exerciseId: replacementId };
               }
               return s;
@@ -387,6 +462,13 @@ export class FitnessTrainingSDK {
       }),
       updatedAt: new Date().toISOString(),
     };
+
+    if (!actuallyChanged) {
+      throw new SubstitutionError(
+        targetExerciseId,
+        '替换执行后计划未发生任何变化，请确认动作和训练日是否正确',
+      );
+    }
 
     this.saveVersion(planId, '替换动作：' + (targetEx ? targetEx.name : targetExerciseId) + ' -> ' + (replacementEx ? replacementEx.name : replacementId), 'substitute');
     this.plans.set(planId, updatedPlan);
@@ -449,14 +531,63 @@ export class FitnessTrainingSDK {
           weekNumber: weekNumber + 1,
           adjustments: [],
           reason: '没有疲劳反馈数据，保持原计划',
+          complianceNotes: ['无疲劳反馈，未进行调整，计划仍遵循原始器械和身体限制'],
         },
       };
     }
 
     const result = adjustPlan(plan, feedback, this.library);
+
+    const avoidedIds = new Set<string>();
+    if (plan.configSnapshot?.limitations) {
+      for (const lim of plan.configSnapshot.limitations) {
+        for (const moveId of lim.movementsToAvoid) {
+          avoidedIds.add(moveId);
+        }
+      }
+    }
+
+    const complianceNotes: string[] = [];
+    if (avoidedIds.size > 0) {
+      const targetWeek = result.adjustedPlan.weeks.find(
+        (w) => w.weekNumber === weekNumber + 1,
+      );
+      const conflictingInWeek = new Set<string>();
+      if (targetWeek) {
+        for (const d of targetWeek.days) {
+          for (const s of d.exercises) {
+            if (avoidedIds.has(s.exerciseId)) conflictingInWeek.add(s.exerciseId);
+          }
+        }
+      }
+      if (conflictingInWeek.size > 0) {
+        complianceNotes.push('注意：下周计划仍包含 ' + conflictingInWeek.size + ' 个与身体限制相关的动作，建议手动检查或替换');
+      } else {
+        complianceNotes.push('已确认：下周计划不包含原始身体限制中的受限动作');
+      }
+
+      const weightActions = result.adjustment.adjustments.filter((a) => a.type === 'modify_weight');
+      const addingWeight = weightActions.some((a) => (a.newValue ?? 0) > 0);
+      if (addingWeight) {
+        complianceNotes.push('已遵守：加量操作已跳过与原始身体限制冲突的动作');
+      }
+    } else {
+      complianceNotes.push('未设定身体限制，本次调整无需额外规避');
+    }
+
+    if (plan.configSnapshot?.equipment && plan.configSnapshot.equipment.length > 0) {
+      complianceNotes.push('本次调整保持原有器械条件：' + plan.configSnapshot.equipment.filter((e) => e !== 'none').join('、') || '仅徒手');
+    }
+
     this.saveVersion(planId, '根据疲劳反馈调整计划', 'adjust');
     this.plans.set(planId, result.adjustedPlan);
-    return result;
+    return {
+      adjustedPlan: result.adjustedPlan,
+      adjustment: {
+        ...result.adjustment,
+        complianceNotes,
+      },
+    };
   }
 
   getProgress(planId: string): PlanProgress {
@@ -554,7 +685,21 @@ export class FitnessTrainingSDK {
       this.plans.set(newPlanId, newPlan);
       this.versions.set(newPlanId, []);
       this.currentVersion.set(newPlanId, 0);
-      this.saveVersion(newPlanId, '导入计划（保留副本）', 'import');
+
+      const importedVersions = (data.versions ?? []).map((v) => ({
+        ...v,
+        plan: { ...v.plan, id: newPlanId },
+        reason: '[导入] ' + v.reason,
+        actionType: v.actionType ?? ('import' as const),
+      }));
+      this.versions.set(newPlanId, importedVersions);
+      const importedMaxVer = importedVersions.length > 0
+        ? Math.max(...importedVersions.map((v) => v.version))
+        : 0;
+      this.currentVersion.set(newPlanId, importedMaxVer);
+
+      this.saveVersion(newPlanId, '导入计划（保留副本，原计划ID: ' + importedPlanId + '）', 'import');
+
       for (const record of data.records) {
         this.store.recordCompletion({ ...record, planId: newPlanId });
       }
@@ -572,9 +717,9 @@ export class FitnessTrainingSDK {
 
       const importedVersions = (data.versions ?? []).map((v) => ({
         ...v,
-        version: v.version + existingMaxVer,
+        version: v.version + existingMaxVer + 1,
         reason: '[导入] ' + v.reason,
-        actionType: v.actionType ?? 'import' as const,
+        actionType: v.actionType ?? ('import' as const),
       }));
 
       const mergedVersions = [...existingVersions, ...importedVersions];
@@ -586,35 +731,63 @@ export class FitnessTrainingSDK {
       this.currentVersion.set(importedPlanId, mergedMaxVer);
 
       this.plans.set(importedPlanId, data.plan);
-      this.saveVersion(importedPlanId, '合并导入计划数据', 'import');
+      this.saveVersion(importedPlanId, '合并导入计划数据（合并' + importedVersions.length + '条历史版本）', 'import');
 
       for (const record of data.records) {
-        this.store.recordCompletion(record);
+        try {
+          this.store.recordCompletion(record);
+        } catch (_) {
+          // ignore duplicates
+        }
       }
       for (const feedback of data.feedbacks) {
-        this.store.submitFatigueFeedback(feedback);
+        try {
+          this.store.submitFatigueFeedback(feedback);
+        } catch (_) {
+          // ignore duplicates
+        }
       }
 
       return data.plan;
     }
 
+    // overwrite (default) or not existing
+    const oldVersions = existingPlan ? (this.versions.get(importedPlanId) ?? []) : [];
     this.plans.set(importedPlanId, data.plan);
-    this.versions.set(importedPlanId, (data.versions ?? []).map((v) => ({
-      ...v,
-      actionType: v.actionType ?? 'import' as const,
-    })));
 
-    const importedVersions = data.versions ?? [];
+    const importedVersions = (data.versions ?? []).map((v) => ({
+      ...v,
+      reason: existingPlan ? '[导入覆盖] ' + v.reason : v.reason,
+      actionType: v.actionType ?? ('import' as const),
+    }));
+    this.versions.set(importedPlanId, importedVersions);
+
     const maxVersion = importedVersions.length > 0
       ? Math.max(...importedVersions.map((v) => v.version))
       : 0;
     this.currentVersion.set(importedPlanId, maxVersion);
 
+    this.saveVersion(
+      importedPlanId,
+      existingPlan
+        ? '覆盖导入计划（原计划含' + oldVersions.length + '个本地版本已替换）'
+        : '导入计划',
+      'import',
+    );
+
     for (const record of data.records) {
-      this.store.recordCompletion(record);
+      try {
+        this.store.recordCompletion(record);
+      } catch (_) {
+        // ignore duplicates
+      }
     }
     for (const feedback of data.feedbacks) {
-      this.store.submitFatigueFeedback(feedback);
+      try {
+        this.store.submitFatigueFeedback(feedback);
+      } catch (_) {
+        // ignore duplicates
+      }
     }
 
     return data.plan;
