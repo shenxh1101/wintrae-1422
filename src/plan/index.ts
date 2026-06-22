@@ -14,6 +14,8 @@ import {
   ExerciseAlternative,
   UnresolvableDay,
   Exercise,
+  PlanConfigSnapshot,
+  RemediationSuggestion,
 } from '../types';
 import { ExerciseLibrary } from '../exercise';
 import { getTemplate } from './templates';
@@ -445,6 +447,19 @@ export function generatePlanWithDiagnostics(
   const canProceed = trainingDaysInWeek > 0;
 
   const summary = buildSummary(allWarnings, allUnresolvable, canProceed, config);
+  const remediationSuggestions = buildRemediationSuggestions(allUnresolvable, allWarnings, config);
+
+  const configSnapshot: PlanConfigSnapshot = {
+    goal: config.goal,
+    availableDaysPerWeek: config.availableDaysPerWeek,
+    equipment: [...config.equipment],
+    limitations: config.limitations ? [...config.limitations] : [],
+    preferredExerciseIds: config.preferredExerciseIds ? [...config.preferredExerciseIds] : [],
+    difficulty: config.difficulty,
+    bodyweight: config.bodyweight,
+    sessionDurationMinutes: config.sessionDurationMinutes,
+    unitSystem: config.unitSystem ?? 'metric',
+  };
 
   const plan: TrainingPlan = {
     id: planId,
@@ -456,6 +471,7 @@ export function generatePlanWithDiagnostics(
     unitSystem: config.unitSystem ?? 'metric',
     difficulty: config.difficulty,
     totalWeeks,
+    configSnapshot,
   };
 
   return {
@@ -463,6 +479,7 @@ export function generatePlanWithDiagnostics(
     warnings: deduplicateWarnings(allWarnings),
     alternatives: deduplicateAlternatives(allAlternatives),
     unresolvableDays: allUnresolvable,
+    remediationSuggestions,
     canProceed,
     summary,
   };
@@ -531,4 +548,59 @@ function deduplicateAlternatives(alternatives: ExerciseAlternative[]): ExerciseA
     seen.add(a.originalExerciseId);
     return true;
   });
+}
+
+function buildRemediationSuggestions(
+  unresolvable: UnresolvableDay[],
+  warnings: PlanGenerationWarning[],
+  config: UserConfig,
+): RemediationSuggestion[] {
+  const suggestions: RemediationSuggestion[] = [];
+
+  const allMissingEquipment = [...new Set(unresolvable.flatMap((d) => d.missingEquipment))];
+  if (allMissingEquipment.length > 0) {
+    suggestions.push({
+      type: 'add_equipment',
+      description: '增加以下器械可解锁更多训练动作：' + allMissingEquipment.join('、'),
+      impact: '可增加' + unresolvable.length + '个训练日的可用动作',
+      missingEquipment: allMissingEquipment,
+    });
+  }
+
+  const allConflictingLimitations = [...new Set(unresolvable.flatMap((d) => d.conflictingLimitations))];
+  if (allConflictingLimitations.length > 0 && config.limitations && config.limitations.length > 0) {
+    for (const lim of allConflictingLimitations) {
+      suggestions.push({
+        type: 'relax_limitation',
+        description: '放宽对 ' + lim + ' 的限制后可安排更多动作',
+        impact: '增加可用动作，丰富训练多样性',
+        limitationToRelax: lim,
+      });
+    }
+  }
+
+  const preferredUnavailable = warnings.filter((w) => w.type === 'preferred_unavailable');
+  if (preferredUnavailable.length > 0) {
+    const prefEquip = [...new Set(preferredUnavailable.flatMap((w) => w.suggestedEquipment ?? []))];
+    if (prefEquip.length > 0) {
+      suggestions.push({
+        type: 'add_equipment',
+        description: '增加以下器械可使用偏好动作：' + prefEquip.join('、'),
+        impact: '提升训练体验和依从性',
+        missingEquipment: prefEquip,
+      });
+    }
+  }
+
+  const minDays = MIN_DAYS_BY_GOAL[config.goal];
+  if (unresolvable.length > 0 && config.availableDaysPerWeek > minDays) {
+    suggestions.push({
+      type: 'reduce_days',
+      description: '可降级为每周' + minDays + '天训练，确保所有训练日都有充足动作',
+      impact: '训练更聚焦，避免无动作的空训练日',
+      reducedDays: minDays,
+    });
+  }
+
+  return suggestions;
 }

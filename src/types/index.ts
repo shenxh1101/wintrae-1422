@@ -116,6 +116,7 @@ export interface TrainingPlan {
   unitSystem: UnitSystem;
   difficulty: DifficultyLevel;
   totalWeeks: number;
+  configSnapshot: PlanConfigSnapshot;
 }
 
 export interface UserConfig {
@@ -257,6 +258,7 @@ export interface PlanGenerationResult {
   warnings: PlanGenerationWarning[];
   alternatives: ExerciseAlternative[];
   unresolvableDays: UnresolvableDay[];
+  remediationSuggestions: RemediationSuggestion[];
   canProceed: boolean;
   summary: string;
 }
@@ -306,5 +308,38 @@ export interface ExportedData {
   versions: PlanVersionSnapshot[];
   exportedAt: string;
   sdkVersion: string;
+}
+
+export interface PlanConfigSnapshot {
+  goal: FitnessGoal;
+  availableDaysPerWeek: number;
+  equipment: EquipmentCategory[];
+  limitations: BodyLimitation[];
+  preferredExerciseIds: string[];
+  difficulty: DifficultyLevel;
+  bodyweight?: number;
+  sessionDurationMinutes?: number;
+  unitSystem: UnitSystem;
+}
+
+export interface SubstitutionPreview {
+  targetExerciseId: string;
+  targetExerciseName: string;
+  replacementExerciseId: string;
+  replacementExerciseName: string;
+  isValid: boolean;
+  validationErrors: string[];
+  impact: SubstitutionImpact[];
+  risks: string[];
+  benefits: string[];
+}
+
+export interface RemediationSuggestion {
+  type: 'add_equipment' | 'relax_limitation' | 'reduce_days' | 'add_preferred';
+  description: string;
+  impact: string;
+  missingEquipment?: EquipmentCategory[];
+  limitationToRelax?: string;
+  reducedDays?: number;
 }
 

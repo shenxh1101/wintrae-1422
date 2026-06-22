@@ -18,8 +18,10 @@ import {
   PlanGenerationResult,
   SubstitutionResult,
   SubstitutionImpact,
+  SubstitutionPreview,
   PlanVersionSnapshot,
   ExportedData,
+  BodyLimitation,
 } from './types';
 
 import { ExerciseLibrary } from './exercise';
@@ -109,6 +111,116 @@ export class FitnessTrainingSDK {
     return this.library.getReplacements(exerciseId, availableEquipment);
   }
 
+  previewSubstitution(
+    planId: string,
+    weekNumber: number,
+    dayOfWeek: number,
+    targetExerciseId: string,
+    replacementId: string,
+  ): SubstitutionPreview {
+    const plan = this.getPlan(planId);
+    const config = plan.configSnapshot;
+
+    const targetEx = this.library.findById(targetExerciseId);
+    const replacementEx = this.library.findById(replacementId);
+
+    const validationErrors: string[] = [];
+
+    if (!targetEx) {
+      validationErrors.push('原动作不存在：' + targetExerciseId);
+    }
+    if (!replacementEx) {
+      validationErrors.push('替换动作不存在：' + replacementId);
+    }
+
+    if (replacementEx && config.equipment && config.equipment.length > 0) {
+      const hasEquipment = replacementEx.equipment.some(
+        (eq) => eq === 'none' || config.equipment.includes(eq),
+      );
+      if (!hasEquipment) {
+        validationErrors.push(
+          '替换动作 ' + replacementEx.name + ' 需要器械 ' +
+          replacementEx.equipment.join('、') + '，当前器械条件不满足',
+        );
+      }
+    }
+
+    if (replacementEx && config.limitations && config.limitations.length > 0) {
+      const avoidedIds = new Set<string>();
+      for (const lim of config.limitations) {
+        for (const moveId of lim.movementsToAvoid) {
+          avoidedIds.add(moveId);
+        }
+      }
+      if (avoidedIds.has(replacementId)) {
+        validationErrors.push(
+          '替换动作 ' + replacementEx.name + ' 在身体限制范围内，不建议使用',
+        );
+      }
+    }
+
+    const impact: SubstitutionImpact[] = [];
+    const week = plan.weeks.find((w) => w.weekNumber === weekNumber);
+    if (week) {
+      const day = week.days.find((d) => d.dayOfWeek === dayOfWeek);
+      if (day) {
+        const affectedIndices: number[] = [];
+        day.exercises.forEach((s, idx) => {
+          if (s.exerciseId === targetExerciseId) {
+            affectedIndices.push(idx + 1);
+          }
+        });
+        if (affectedIndices.length > 0) {
+          impact.push({
+            weekNumber,
+            dayOfWeek,
+            dayLabel: day.label,
+            setIndices: affectedIndices,
+          });
+        }
+      }
+    }
+
+    const risks: string[] = [];
+    const benefits: string[] = [];
+
+    if (targetEx && replacementEx) {
+      if (targetEx.difficulty !== replacementEx.difficulty) {
+        if (['intermediate', 'advanced'].includes(replacementEx.difficulty) &&
+            targetEx.difficulty === 'beginner') {
+          risks.push('替换动作难度高于原动作，可能需要适应期');
+        } else if (replacementEx.difficulty === 'beginner' &&
+                   targetEx.difficulty !== 'beginner') {
+          benefits.push('替换动作难度更低，更容易完成');
+        }
+      }
+
+      const targetMg = new Set(targetEx.muscleGroups);
+      const repMg = new Set(replacementEx.muscleGroups);
+      const missingMg = [...targetMg].filter((m) => !repMg.has(m));
+      if (missingMg.length > 0) {
+        risks.push('替换动作不覆盖原动作的以下肌群：' + missingMg.join('、'));
+      }
+
+      const newMg = [...repMg].filter((m) => !targetMg.has(m));
+      if (newMg.length > 0) {
+        benefits.push('替换动作额外锻炼以下肌群：' + newMg.join('、'));
+      }
+    }
+
+    return {
+      targetExerciseId,
+      targetExerciseName: targetEx ? targetEx.name : targetExerciseId,
+      replacementExerciseId: replacementId,
+      replacementExerciseName: replacementEx ? replacementEx.name : replacementId,
+      isValid: validationErrors.length === 0,
+      validationErrors,
+      impact,
+      risks,
+      benefits,
+    };
+  }
+
   substituteExercise(
     planId: string,
     weekNumber: number,
@@ -116,6 +228,11 @@ export class FitnessTrainingSDK {
     targetExerciseId: string,
     replacementId: string,
   ): SubstitutionResult {
+    const preview = this.previewSubstitution(planId, weekNumber, dayOfWeek, targetExerciseId, replacementId);
+    if (!preview.isValid) {
+      throw new SubstitutionError(targetExerciseId, preview.validationErrors.join('；'));
+    }
+
     const plan = this.getPlan(planId);
 
     const targetEx = this.library.findById(targetExerciseId);
@@ -319,8 +436,13 @@ export class FitnessTrainingSDK {
 
   importData(data: ExportedData): void {
     this.plans.set(data.plan.id, data.plan);
-    this.currentVersion.set(data.plan.id, data.plan.totalWeeks);
     this.versions.set(data.plan.id, data.versions ?? []);
+
+    const importedVersions = data.versions ?? [];
+    const maxVersion = importedVersions.length > 0
+      ? Math.max(...importedVersions.map((v) => v.version))
+      : 0;
+    this.currentVersion.set(data.plan.id, maxVersion);
 
     for (const record of data.records) {
       this.store.recordCompletion(record);

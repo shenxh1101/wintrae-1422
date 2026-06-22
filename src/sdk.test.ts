@@ -6,8 +6,9 @@ import {
   InsufficientDaysError,
   NoAvailableEquipmentError,
   PlanNotFoundError,
+  SubstitutionError,
 } from './errors';
-import { Exercise, WorkoutDay, ExerciseSet, EquipmentCategory, SubstitutionResult, PlanGenerationResult, ExportedData } from './types';
+import { Exercise, WorkoutDay, ExerciseSet, EquipmentCategory, SubstitutionResult, PlanGenerationResult, ExportedData, SubstitutionPreview } from './types';
 
 describe('FitnessTrainingSDK', () => {
   let sdk: FitnessTrainingSDK;
@@ -243,6 +244,16 @@ describe('FitnessTrainingSDK', () => {
         expect(plan.weeks.length).toBeGreaterThan(0);
       }
     });
+
+    test('should include configSnapshot in generated plan', () => {
+      const plan = sdk.generatePlan(baseConfig);
+      expect(plan.configSnapshot).toBeDefined();
+      expect(plan.configSnapshot.goal).toBe(baseConfig.goal);
+      expect(plan.configSnapshot.availableDaysPerWeek).toBe(baseConfig.availableDaysPerWeek);
+      expect(plan.configSnapshot.equipment).toEqual(baseConfig.equipment);
+      expect(plan.configSnapshot.difficulty).toBe(baseConfig.difficulty);
+      expect(plan.configSnapshot.unitSystem).toBe('metric');
+    });
   });
 
   describe('Plan Generation with Diagnostics', () => {
@@ -365,6 +376,23 @@ describe('FitnessTrainingSDK', () => {
         ],
       };
       expect(() => sdk.generatePlan(config)).toThrow(NoAvailableEquipmentError);
+    });
+
+    test('should include remediationSuggestions in diagnostics result', () => {
+      const config = {
+        ...baseConfig,
+        equipment: ['none'] as EquipmentCategory[],
+        goal: 'endurance' as const,
+      };
+      const result = sdk.generatePlanWithDiagnostics(config);
+      expect(result.remediationSuggestions).toBeDefined();
+      expect(Array.isArray(result.remediationSuggestions)).toBe(true);
+      if (result.remediationSuggestions.length > 0) {
+        const sug = result.remediationSuggestions[0];
+        expect(sug.type).toBeDefined();
+        expect(sug.description).toBeDefined();
+        expect(sug.impact).toBeDefined();
+      }
     });
   });
 
@@ -703,6 +731,65 @@ describe('FitnessTrainingSDK', () => {
       difficulty: 'intermediate' as const,
     });
 
+    test('should preview substitution with impact and validation', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub_pre'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstExerciseId = trainingDay.exercises[0].exerciseId;
+      const exercise = sdk.findExercise(firstExerciseId);
+      if (!exercise || exercise.replacementIds.length === 0) return;
+
+      const replacementId = exercise.replacementIds[0];
+      const preview = sdk.previewSubstitution(
+        plan.id,
+        1,
+        trainingDay.dayOfWeek,
+        firstExerciseId,
+        replacementId,
+      );
+
+      expect(preview.targetExerciseId).toBe(firstExerciseId);
+      expect(preview.replacementExerciseId).toBe(replacementId);
+      expect(preview.isValid).toBe(true);
+      expect(preview.validationErrors.length).toBe(0);
+      expect(preview.impact).toBeDefined();
+      expect(Array.isArray(preview.risks)).toBe(true);
+      expect(Array.isArray(preview.benefits)).toBe(true);
+    });
+
+    test('should return isValid=false for substitution with unavailable equipment', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub_inv_eq'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstExerciseId = trainingDay.exercises[0].exerciseId;
+      const preview = sdk.previewSubstitution(
+        plan.id,
+        1,
+        trainingDay.dayOfWeek,
+        firstExerciseId,
+        'kettlebell_swing',
+      );
+
+      expect(preview.isValid).toBe(false);
+      expect(preview.validationErrors.length).toBeGreaterThan(0);
+    });
+
+    test('should throw SubstitutionError when substituting invalid replacement', () => {
+      const plan = sdk.generatePlan(makeConfig('user_sub_throw'));
+      const week1 = plan.weeks[0];
+      const trainingDay = week1.days.find((d: WorkoutDay) => !d.isRestDay && d.exercises.length > 0);
+      if (!trainingDay) return;
+
+      const firstExerciseId = trainingDay.exercises[0].exerciseId;
+      expect(() =>
+        sdk.substituteExercise(plan.id, 1, trainingDay.dayOfWeek, firstExerciseId, 'kettlebell_swing'),
+      ).toThrow(SubstitutionError);
+    });
+
     test('should substitute exercise and return SubstitutionResult', () => {
       const plan = sdk.generatePlan(makeConfig('user_sub'));
       const week1 = plan.weeks[0];
@@ -1035,6 +1122,45 @@ describe('FitnessTrainingSDK', () => {
 
     test('should throw PlanNotFoundError when exporting non-existent plan', () => {
       expect(() => sdk.exportData('nonexistent_plan')).toThrow(PlanNotFoundError);
+    });
+
+    test('should preserve version history and continue version numbering after import', () => {
+      const plan = sdk.generatePlan(makeConfig('user_imp_ver'));
+      sdk.convertPlanUnits(plan.id, 'imperial');
+      expect(sdk.getCurrentVersion(plan.id)).toBe(1);
+      expect(sdk.getPlanVersions(plan.id).length).toBe(1);
+
+      sdk.convertPlanUnits(plan.id, 'metric');
+      expect(sdk.getCurrentVersion(plan.id)).toBe(2);
+      expect(sdk.getPlanVersions(plan.id).length).toBe(2);
+
+      const exported = sdk.exportData(plan.id);
+      const json = JSON.stringify(exported);
+
+      const newSdk = new FitnessTrainingSDK();
+      newSdk.importData(JSON.parse(json));
+
+      expect(newSdk.getCurrentVersion(exported.plan.id)).toBe(2);
+      expect(newSdk.getPlanVersions(exported.plan.id).length).toBe(2);
+
+      newSdk.convertPlanUnits(exported.plan.id, 'imperial');
+      expect(newSdk.getCurrentVersion(exported.plan.id)).toBe(3);
+      expect(newSdk.getPlanVersions(exported.plan.id).length).toBe(3);
+    });
+
+    test('should rollback correctly after import', () => {
+      const plan = sdk.generatePlan(makeConfig('user_imp_rb'));
+      sdk.convertPlanUnits(plan.id, 'imperial');
+
+      const exported = sdk.exportData(plan.id);
+      const json = JSON.stringify(exported);
+
+      const newSdk = new FitnessTrainingSDK();
+      newSdk.importData(JSON.parse(json));
+
+      const rolledBack = newSdk.rollbackToVersion(exported.plan.id, 1);
+      expect(rolledBack).toBeDefined();
+      expect(newSdk.getCurrentVersion(exported.plan.id)).toBe(2);
     });
   });
 });
