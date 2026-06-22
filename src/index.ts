@@ -19,8 +19,11 @@ import {
   SubstitutionResult,
   SubstitutionImpact,
   SubstitutionPreview,
+  SubstitutionCandidate,
   PlanVersionSnapshot,
   ExportedData,
+  ImportOptions,
+  ImportConflictStrategy,
   BodyLimitation,
 } from './types';
 
@@ -74,6 +77,23 @@ export class FitnessTrainingSDK {
       this.versions.set(result.plan.id, []);
     }
     return result;
+  }
+
+  regeneratePlan(originalConfig: UserConfig, overrides: Partial<UserConfig>, totalWeeks?: number): PlanGenerationResult {
+    const mergedConfig: UserConfig = {
+      userId: overrides.userId ?? originalConfig.userId,
+      goal: overrides.goal ?? originalConfig.goal,
+      availableDaysPerWeek: overrides.availableDaysPerWeek ?? originalConfig.availableDaysPerWeek,
+      equipment: overrides.equipment ?? originalConfig.equipment,
+      limitations: overrides.limitations ?? originalConfig.limitations,
+      preferredExerciseIds: overrides.preferredExerciseIds ?? originalConfig.preferredExerciseIds,
+      difficulty: overrides.difficulty ?? originalConfig.difficulty,
+      sessionDurationMinutes: overrides.sessionDurationMinutes ?? originalConfig.sessionDurationMinutes,
+      unitSystem: overrides.unitSystem ?? originalConfig.unitSystem,
+      bodyweight: overrides.bodyweight ?? originalConfig.bodyweight,
+      maxWeights: overrides.maxWeights ?? originalConfig.maxWeights,
+    };
+    return this.generatePlanWithDiagnostics(mergedConfig, totalWeeks);
   }
 
   getPlan(planId: string): TrainingPlan {
@@ -160,8 +180,8 @@ export class FitnessTrainingSDK {
     }
 
     const impact: SubstitutionImpact[] = [];
-    const week = plan.weeks.find((w) => w.weekNumber === weekNumber);
-    if (week) {
+    for (const week of plan.weeks) {
+      if (week.weekNumber < weekNumber) continue;
       const day = week.days.find((d) => d.dayOfWeek === dayOfWeek);
       if (day) {
         const affectedIndices: number[] = [];
@@ -172,7 +192,7 @@ export class FitnessTrainingSDK {
         });
         if (affectedIndices.length > 0) {
           impact.push({
-            weekNumber,
+            weekNumber: week.weekNumber,
             dayOfWeek,
             dayLabel: day.label,
             setIndices: affectedIndices,
@@ -183,20 +203,31 @@ export class FitnessTrainingSDK {
 
     const risks: string[] = [];
     const benefits: string[] = [];
+    let reason = '';
 
     if (targetEx && replacementEx) {
+      const targetMg = new Set(targetEx.muscleGroups);
+      const repMg = new Set(replacementEx.muscleGroups);
+      const overlap = [...targetMg].filter((m) => repMg.has(m));
+
+      if (overlap.length > 0) {
+        reason = '共享肌群：' + overlap.join('、');
+      } else {
+        reason = '肌群不同，' + replacementEx.name + '锻炼' + [...repMg].join('、');
+      }
+
       if (targetEx.difficulty !== replacementEx.difficulty) {
         if (['intermediate', 'advanced'].includes(replacementEx.difficulty) &&
             targetEx.difficulty === 'beginner') {
           risks.push('替换动作难度高于原动作，可能需要适应期');
+          reason += '；难度更高';
         } else if (replacementEx.difficulty === 'beginner' &&
                    targetEx.difficulty !== 'beginner') {
           benefits.push('替换动作难度更低，更容易完成');
+          reason += '；难度更低';
         }
       }
 
-      const targetMg = new Set(targetEx.muscleGroups);
-      const repMg = new Set(replacementEx.muscleGroups);
       const missingMg = [...targetMg].filter((m) => !repMg.has(m));
       if (missingMg.length > 0) {
         risks.push('替换动作不覆盖原动作的以下肌群：' + missingMg.join('、'));
@@ -218,7 +249,85 @@ export class FitnessTrainingSDK {
       impact,
       risks,
       benefits,
+      reason,
     };
+  }
+
+  getSubstitutionCandidates(
+    planId: string,
+    weekNumber: number,
+    dayOfWeek: number,
+    targetExerciseId: string,
+  ): SubstitutionCandidate[] {
+    const plan = this.getPlan(planId);
+    const config = plan.configSnapshot;
+    const targetEx = this.library.findById(targetExerciseId);
+    if (!targetEx) return [];
+
+    const avoidedIds = new Set<string>();
+    if (config.limitations) {
+      for (const lim of config.limitations) {
+        for (const moveId of lim.movementsToAvoid) {
+          avoidedIds.add(moveId);
+        }
+      }
+    }
+
+    const replacements = this.library.getReplacements(targetExerciseId);
+    const candidates: SubstitutionCandidate[] = [];
+
+    for (const rep of replacements) {
+      const preview = this.previewSubstitution(planId, weekNumber, dayOfWeek, targetExerciseId, rep.id);
+      candidates.push({ exercise: rep, preview });
+    }
+
+    return candidates;
+  }
+
+  confirmSubstitution(preview: SubstitutionPreview): SubstitutionResult {
+    if (!preview.isValid) {
+      throw new SubstitutionError(
+        preview.targetExerciseId,
+        '替换未通过校验：' + preview.validationErrors.join('；'),
+      );
+    }
+
+    const planId = this.findPlanIdByExercise(preview.targetExerciseId, preview.impact);
+    if (!planId) {
+      throw new SubstitutionError(preview.targetExerciseId, '找不到对应的训练计划');
+    }
+
+    return this.substituteExercise(
+      planId,
+      preview.impact[0].weekNumber,
+      preview.impact[0].dayOfWeek,
+      preview.targetExerciseId,
+      preview.replacementExerciseId,
+    );
+  }
+
+  private findPlanIdByExercise(exerciseId: string, impact: SubstitutionImpact[]): string | null {
+    for (const [planId, plan] of this.plans) {
+      if (impact.length > 0) {
+        const week = plan.weeks.find((w) => w.weekNumber === impact[0].weekNumber);
+        if (week) {
+          const day = week.days.find((d) => d.dayOfWeek === impact[0].dayOfWeek);
+          if (day && day.exercises.some((s) => s.exerciseId === exerciseId)) {
+            return planId;
+          }
+        }
+      }
+    }
+    for (const [planId, plan] of this.plans) {
+      for (const week of plan.weeks) {
+        for (const day of week.days) {
+          if (day.exercises.some((s) => s.exerciseId === exerciseId)) {
+            return planId;
+          }
+        }
+      }
+    }
+    return null;
   }
 
   substituteExercise(
@@ -279,7 +388,7 @@ export class FitnessTrainingSDK {
       updatedAt: new Date().toISOString(),
     };
 
-    this.saveVersion(planId, '替换动作：' + (targetEx ? targetEx.name : targetExerciseId) + ' -> ' + (replacementEx ? replacementEx.name : replacementId));
+    this.saveVersion(planId, '替换动作：' + (targetEx ? targetEx.name : targetExerciseId) + ' -> ' + (replacementEx ? replacementEx.name : replacementId), 'substitute');
     this.plans.set(planId, updatedPlan);
 
     const availableReplacements = this.library.getReplacements(targetExerciseId);
@@ -345,7 +454,7 @@ export class FitnessTrainingSDK {
     }
 
     const result = adjustPlan(plan, feedback, this.library);
-    this.saveVersion(planId, '根据疲劳反馈调整计划');
+    this.saveVersion(planId, '根据疲劳反馈调整计划', 'adjust');
     this.plans.set(planId, result.adjustedPlan);
     return result;
   }
@@ -363,7 +472,7 @@ export class FitnessTrainingSDK {
   convertPlanUnits(planId: string, targetUnit: UnitSystem): TrainingPlan {
     const plan = this.getPlan(planId);
     const converted = convertPlanUnits(plan, targetUnit);
-    this.saveVersion(planId, '切换单位为' + (targetUnit === 'metric' ? '公制' : '英制'));
+    this.saveVersion(planId, '切换单位为' + (targetUnit === 'metric' ? '公制' : '英制'), 'unit_convert');
     this.plans.set(planId, converted);
     return converted;
   }
@@ -414,7 +523,7 @@ export class FitnessTrainingSDK {
     }
 
     this.plans.set(planId, { ...snapshot.plan });
-    this.saveVersion(planId, '回滚至版本' + version);
+    this.saveVersion(planId, '回滚至版本' + version, 'rollback');
     return this.getPlan(planId);
   }
 
@@ -434,26 +543,84 @@ export class FitnessTrainingSDK {
     };
   }
 
-  importData(data: ExportedData): void {
-    this.plans.set(data.plan.id, data.plan);
-    this.versions.set(data.plan.id, data.versions ?? []);
+  importData(data: ExportedData, options?: ImportOptions): TrainingPlan {
+    const strategy = options?.strategy ?? 'overwrite';
+    const importedPlanId = data.plan.id;
+    const existingPlan = this.plans.get(importedPlanId);
+
+    if (existingPlan && strategy === 'keep_both') {
+      const newPlanId = importedPlanId + '_imported_' + Date.now();
+      const newPlan: TrainingPlan = { ...data.plan, id: newPlanId };
+      this.plans.set(newPlanId, newPlan);
+      this.versions.set(newPlanId, []);
+      this.currentVersion.set(newPlanId, 0);
+      this.saveVersion(newPlanId, '导入计划（保留副本）', 'import');
+      for (const record of data.records) {
+        this.store.recordCompletion({ ...record, planId: newPlanId });
+      }
+      for (const feedback of data.feedbacks) {
+        this.store.submitFatigueFeedback({ ...feedback, planId: newPlanId });
+      }
+      return newPlan;
+    }
+
+    if (existingPlan && strategy === 'merge') {
+      const existingVersions = this.versions.get(importedPlanId) ?? [];
+      const existingMaxVer = existingVersions.length > 0
+        ? Math.max(...existingVersions.map((v) => v.version))
+        : 0;
+
+      const importedVersions = (data.versions ?? []).map((v) => ({
+        ...v,
+        version: v.version + existingMaxVer,
+        reason: '[导入] ' + v.reason,
+        actionType: v.actionType ?? 'import' as const,
+      }));
+
+      const mergedVersions = [...existingVersions, ...importedVersions];
+      this.versions.set(importedPlanId, mergedVersions);
+
+      const mergedMaxVer = mergedVersions.length > 0
+        ? Math.max(...mergedVersions.map((v) => v.version))
+        : 0;
+      this.currentVersion.set(importedPlanId, mergedMaxVer);
+
+      this.plans.set(importedPlanId, data.plan);
+      this.saveVersion(importedPlanId, '合并导入计划数据', 'import');
+
+      for (const record of data.records) {
+        this.store.recordCompletion(record);
+      }
+      for (const feedback of data.feedbacks) {
+        this.store.submitFatigueFeedback(feedback);
+      }
+
+      return data.plan;
+    }
+
+    this.plans.set(importedPlanId, data.plan);
+    this.versions.set(importedPlanId, (data.versions ?? []).map((v) => ({
+      ...v,
+      actionType: v.actionType ?? 'import' as const,
+    })));
 
     const importedVersions = data.versions ?? [];
     const maxVersion = importedVersions.length > 0
       ? Math.max(...importedVersions.map((v) => v.version))
       : 0;
-    this.currentVersion.set(data.plan.id, maxVersion);
+    this.currentVersion.set(importedPlanId, maxVersion);
 
     for (const record of data.records) {
       this.store.recordCompletion(record);
     }
-
     for (const feedback of data.feedbacks) {
       this.store.submitFatigueFeedback(feedback);
     }
+
+    return data.plan;
   }
 
-  private saveVersion(planId: string, reason: string): void {
+  private saveVersion(planId: string, reason: string, actionType: PlanVersionSnapshot['actionType'] = 'adjust'): void {
     const plan = this.plans.get(planId);
     if (!plan) return;
 
@@ -465,6 +632,7 @@ export class FitnessTrainingSDK {
       version: ver,
       timestamp: new Date().toISOString(),
       reason,
+      actionType,
       plan: JSON.parse(JSON.stringify(plan)),
     });
     this.versions.set(planId, versionList);

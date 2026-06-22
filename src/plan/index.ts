@@ -337,10 +337,25 @@ function buildWorkoutDay(
     };
     warnings.push({
       type: 'day_underpopulated',
-      message: dayTemplate.label + '无可用动作，需要增加器械或放宽限制',
+      message: dayTemplate.label + '无可用动作，已转为休息日',
       muscleGroups: dayTemplate.muscleGroups,
       suggestedEquipment: uniqueNeeded,
     });
+
+    return {
+      workout: {
+        dayOfWeek: dayIndex + 1,
+        label: '休息日',
+        isRestDay: true,
+        muscleGroups: [],
+        exercises: [],
+        warmup: [],
+        estimatedDurationMinutes: 0,
+      },
+      warnings,
+      alternatives,
+      unresolvable,
+    };
   }
 
   const allSets: ExerciseSet[] = [];
@@ -368,7 +383,7 @@ function buildWorkoutDay(
   return {
     workout: {
       dayOfWeek: dayIndex + 1,
-      label: selectedExercises.length === 0 ? dayTemplate.label + '（无法安排）' : dayTemplate.label,
+      label: dayTemplate.label,
       isRestDay: false,
       muscleGroups: dayTemplate.muscleGroups,
       exercises: allSets,
@@ -564,19 +579,30 @@ function buildRemediationSuggestions(
       description: '增加以下器械可解锁更多训练动作：' + allMissingEquipment.join('、'),
       impact: '可增加' + unresolvable.length + '个训练日的可用动作',
       missingEquipment: allMissingEquipment,
+      suggestedConfig: {
+        equipment: [...config.equipment, ...allMissingEquipment],
+      },
     });
   }
 
   const allConflictingLimitations = [...new Set(unresolvable.flatMap((d) => d.conflictingLimitations))];
   if (allConflictingLimitations.length > 0 && config.limitations && config.limitations.length > 0) {
-    for (const lim of allConflictingLimitations) {
-      suggestions.push({
-        type: 'relax_limitation',
-        description: '放宽对 ' + lim + ' 的限制后可安排更多动作',
-        impact: '增加可用动作，丰富训练多样性',
-        limitationToRelax: lim,
-      });
-    }
+    const relaxedLimitations = config.limitations.map((lim) => ({
+      ...lim,
+      movementsToAvoid: lim.movementsToAvoid.filter((m) => !allConflictingLimitations.includes(m)),
+    })).filter((lim) => lim.movementsToAvoid.length < (config.limitations?.find((l) => l.area === lim.area)?.movementsToAvoid.length ?? 0));
+    suggestions.push({
+      type: 'relax_limitation',
+      description: '放宽对 ' + allConflictingLimitations.join('、') + ' 的限制后可安排更多动作',
+      impact: '增加可用动作，丰富训练多样性',
+      limitationToRelax: allConflictingLimitations[0],
+      suggestedConfig: {
+        limitations: config.limitations.map((lim) => ({
+          ...lim,
+          movementsToAvoid: lim.movementsToAvoid.filter((m) => !allConflictingLimitations.includes(m)),
+        })),
+      },
+    });
   }
 
   const preferredUnavailable = warnings.filter((w) => w.type === 'preferred_unavailable');
@@ -588,6 +614,9 @@ function buildRemediationSuggestions(
         description: '增加以下器械可使用偏好动作：' + prefEquip.join('、'),
         impact: '提升训练体验和依从性',
         missingEquipment: prefEquip,
+        suggestedConfig: {
+          equipment: [...config.equipment, ...prefEquip],
+        },
       });
     }
   }
@@ -599,6 +628,9 @@ function buildRemediationSuggestions(
       description: '可降级为每周' + minDays + '天训练，确保所有训练日都有充足动作',
       impact: '训练更聚焦，避免无动作的空训练日',
       reducedDays: minDays,
+      suggestedConfig: {
+        availableDaysPerWeek: minDays,
+      },
     });
   }
 

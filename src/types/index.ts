@@ -168,6 +168,7 @@ export interface WeeklyReport {
   fatigueTrend: FatigueLevel[];
   recommendations: string[];
   nextWeekPreview: WorkoutDay[];
+  configNotes: string[];
 }
 
 export interface PersonalRecord {
@@ -298,6 +299,7 @@ export interface PlanVersionSnapshot {
   version: number;
   timestamp: string;
   reason: string;
+  actionType: 'create' | 'import' | 'substitute' | 'adjust' | 'unit_convert' | 'rollback';
   plan: TrainingPlan;
 }
 
@@ -332,6 +334,18 @@ export interface SubstitutionPreview {
   impact: SubstitutionImpact[];
   risks: string[];
   benefits: string[];
+  reason: string;
+}
+
+export interface SubstitutionCandidate {
+  exercise: Exercise;
+  preview: SubstitutionPreview;
+}
+
+export type ImportConflictStrategy = 'overwrite' | 'keep_both' | 'merge';
+
+export interface ImportOptions {
+  strategy: ImportConflictStrategy;
 }
 
 export interface RemediationSuggestion {
@@ -341,5 +355,6 @@ export interface RemediationSuggestion {
   missingEquipment?: EquipmentCategory[];
   limitationToRelax?: string;
   reducedDays?: number;
+  suggestedConfig?: Partial<UserConfig>;
 }
 

@@ -6,6 +6,7 @@ import {
   FatigueLevel,
   MuscleGroup,
   ExerciseSet,
+  BodyLimitation,
 } from '../types';
 import { ExerciseLibrary } from '../exercise';
 import { computeSetsForWeek, getProgressionConfig } from '../plan/progression';
@@ -17,6 +18,16 @@ export function adjustPlan(
 ): { adjustedPlan: TrainingPlan; adjustment: PlanAdjustment } {
   const actions: AdjustmentAction[] = [];
   let adjustedPlan = { ...plan, weeks: plan.weeks.map((w) => ({ ...w })) };
+  const config = plan.configSnapshot;
+
+  const avoidedIds = new Set<string>();
+  if (config?.limitations) {
+    for (const lim of config.limitations) {
+      for (const moveId of lim.movementsToAvoid) {
+        avoidedIds.add(moveId);
+      }
+    }
+  }
 
   const targetWeekIndex = plan.weeks.findIndex((w) => w.weekNumber === feedback.weekNumber + 1);
   if (targetWeekIndex === -1) {
@@ -50,12 +61,23 @@ export function adjustPlan(
   }
 
   if (feedback.overallFatigue <= 3) {
-    actions.push({
-      type: 'modify_weight',
-      newValue: 5,
-      description: '疲劳感较低，下周训练重量增加5%',
-    });
-    adjustedPlan = applyWeightReduction(adjustedPlan, targetWeekIndex, 1.05);
+    const hasConflictingExercises = adjustedPlan.weeks[targetWeekIndex]?.days.some((d) =>
+      d.exercises.some((s) => avoidedIds.has(s.exerciseId)),
+    );
+    if (hasConflictingExercises) {
+      actions.push({
+        type: 'modify_weight',
+        newValue: 5,
+        description: '疲劳感较低，下周训练重量增加5%（已排除与身体限制冲突的动作）',
+      });
+    } else {
+      actions.push({
+        type: 'modify_weight',
+        newValue: 5,
+        description: '疲劳感较低，下周训练重量增加5%',
+      });
+    }
+    adjustedPlan = applyWeightReduction(adjustedPlan, targetWeekIndex, 1.05, avoidedIds);
   }
 
   if (feedback.sleepQuality <= 3) {
@@ -101,17 +123,19 @@ export function adjustPlan(
   };
 }
 
-function applyWeightReduction(plan: TrainingPlan, weekIndex: number, factor: number): TrainingPlan {
+function applyWeightReduction(plan: TrainingPlan, weekIndex: number, factor: number, avoidedIds?: Set<string>): TrainingPlan {
   const weeks = plan.weeks.map((w, i) => {
     if (i !== weekIndex) return w;
     return {
       ...w,
       days: w.days.map((d) => ({
         ...d,
-        exercises: d.exercises.map((s) => ({
-          ...s,
-          targetWeight: Math.round(s.targetWeight * factor * 10) / 10,
-        })),
+        exercises: d.exercises.map((s) => {
+          if (avoidedIds && avoidedIds.has(s.exerciseId) && factor > 1) {
+            return s;
+          }
+          return { ...s, targetWeight: Math.round(s.targetWeight * factor * 10) / 10 };
+        }),
       })),
     };
   });

@@ -1,5 +1,6 @@
 import {
   TrainingPlan,
+  TrainingWeek,
   PlanProgress,
   WeeklyReport,
   PersonalRecord,
@@ -202,6 +203,8 @@ export function generateWeeklyReport(
     ? nextWeek.days.filter((d) => !d.isRestDay)
     : [];
 
+  const configNotes = generateConfigNotes(plan, week);
+
   return {
     planId: plan.id,
     weekNumber,
@@ -233,6 +236,7 @@ export function generateWeeklyReport(
     fatigueTrend,
     recommendations,
     nextWeekPreview,
+    configNotes,
   };
 }
 
@@ -290,5 +294,70 @@ function emptyReport(planId: string, weekNumber: number): WeeklyReport {
     fatigueTrend: [],
     recommendations: ['暂无数据，完成训练后即可生成报告'],
     nextWeekPreview: [],
+    configNotes: [],
   };
+}
+
+function generateConfigNotes(plan: TrainingPlan, week: TrainingWeek): string[] {
+  const notes: string[] = [];
+  const config = plan.configSnapshot;
+  if (!config) return notes;
+
+  if (config.equipment && config.equipment.length > 0) {
+    const eqList = config.equipment.filter((e) => e !== 'none');
+    if (eqList.length > 0) {
+      notes.push('可用器械：' + eqList.join('、'));
+    } else {
+      notes.push('仅徒手训练，动作选择受限');
+    }
+  }
+
+  if (config.limitations && config.limitations.length > 0) {
+    const limDescs = config.limitations.map((l) => l.area + '（' + l.severity + '）');
+    notes.push('身体限制：' + limDescs.join('、'));
+
+    const avoidedIds = new Set<string>();
+    for (const lim of config.limitations) {
+      for (const moveId of lim.movementsToAvoid) {
+        avoidedIds.add(moveId);
+      }
+    }
+
+    const weekExerciseIds = new Set<string>();
+    for (const day of week.days) {
+      for (const set of day.exercises) {
+        weekExerciseIds.add(set.exerciseId);
+      }
+    }
+
+    const avoidedInWeek = [...avoidedIds].filter((id) => weekExerciseIds.has(id));
+    if (avoidedInWeek.length > 0) {
+      notes.push('本周仍有限制动作出现在计划中，建议检查或替换');
+    }
+  }
+
+  if (config.preferredExerciseIds && config.preferredExerciseIds.length > 0) {
+    const weekExerciseIds = new Set<string>();
+    for (const day of week.days) {
+      for (const set of day.exercises) {
+        weekExerciseIds.add(set.exerciseId);
+      }
+    }
+    const usedPreferred = config.preferredExerciseIds.filter((id) => weekExerciseIds.has(id));
+    const unusedPreferred = config.preferredExerciseIds.filter((id) => !weekExerciseIds.has(id));
+    if (usedPreferred.length > 0) {
+      notes.push('已优先安排' + usedPreferred.length + '个偏好动作');
+    }
+    if (unusedPreferred.length > 0) {
+      notes.push(unusedPreferred.length + '个偏好动作因器械或限制未能安排');
+    }
+  }
+
+  const restDays = week.days.filter((d) => d.isRestDay).length;
+  const trainingDays = week.days.filter((d) => !d.isRestDay && d.exercises.length > 0).length;
+  if (trainingDays < config.availableDaysPerWeek) {
+    notes.push('本周实际训练' + trainingDays + '天，少于计划的' + config.availableDaysPerWeek + '天（部分训练日因条件不足转为休息日）');
+  }
+
+  return notes;
 }
